@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import {
   access,
+  chmod,
+  lstat,
   mkdir,
   mkdtemp,
+  open,
+  readFile,
   rm,
   symlink,
   writeFile,
@@ -14,7 +18,9 @@ import test from "node:test";
 import { execa } from "execa";
 
 import {
+  assertOpenedFileContained,
   collectDiffs,
+  MAX_REVIEW_FILES,
   PER_FILE_DIFF_BYTES,
   runGitDiffProcess,
   TOTAL_DIFF_BYTES,
@@ -177,6 +183,37 @@ test("collector preserves UTF-8 boundaries at the remaining total budget", async
     calls,
     files.slice(0, 4).map(({ path }) => path),
   );
+});
+
+test("collector rejects more than 64 files before invoking the runner", async () => {
+  let calls = 0;
+  const tooMany = Array.from({ length: 65 }, (_, index) =>
+    reviewFile(`src/file-${index}.ts`),
+  );
+
+  await assert.rejects(
+    collectDiffs("/repo", tooMany, async () => {
+      calls += 1;
+      return "";
+    }),
+    /at most 64 review files/,
+  );
+  assert.equal(calls, 0);
+});
+
+test("collector accepts exactly 64 files", async () => {
+  let calls = 0;
+  const maximum = Array.from({ length: MAX_REVIEW_FILES }, (_, index) =>
+    reviewFile(`src/file-${index}.ts`),
+  );
+
+  const result = await collectDiffs("/repo", maximum, async () => {
+    calls += 1;
+    return "";
+  });
+
+  assert.equal(calls, MAX_REVIEW_FILES);
+  assert.equal(result.length, MAX_REVIEW_FILES);
 });
 
 test("collector validates the complete path list before invoking the runner", async () => {
@@ -396,10 +433,21 @@ test("runGitDiffProcess passes an option-like path after Git's option terminator
   assert.doesNotMatch(output, /other (?:before|after)/);
 });
 
-test("runGitDiffProcess does not resolve Git from the target repository", async (t) => {
+test("runGitDiffProcess ignores hostile parent PATH", async (t) => {
   const repo = await mkdtemp(join(tmpdir(), "trustgate-hostile-git-"));
+  const hostileBin = await mkdtemp(join(tmpdir(), "trustgate-hostile-path-"));
+  const marker = join(hostileBin, "HOSTILE_PATH_GIT_EXECUTED");
+  const originalPath = process.env.PATH;
   t.after(async () => {
-    await rm(repo, { recursive: true, force: true });
+    if (originalPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = originalPath;
+    }
+    await Promise.all([
+      rm(repo, { recursive: true, force: true }),
+      rm(hostileBin, { recursive: true, force: true }),
+    ]);
   });
   await initializeRepository(repo);
 
@@ -413,25 +461,95 @@ test("runGitDiffProcess does not resolve Git from the target repository", async 
     preferLocal: false,
   });
   await writeFile(join(repo, "selected.txt"), "after\n");
-
-  const localBin = join(repo, "node_modules", ".bin");
-  const marker = join(repo, "HOSTILE_LOCAL_GIT_EXECUTED");
-  await mkdir(localBin, { recursive: true });
   await writeFile(
-    join(localBin, "git"),
-    `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed");\n`,
+    join(hostileBin, "git"),
+    `#!/bin/sh\nprintf executed > ${JSON.stringify(marker)}\nexit 93\n`,
+    { mode: 0o755 },
+  );
+  process.env.PATH = hostileBin;
+
+  const output = await runGitDiffProcess(repo, "selected.txt");
+
+  await assert.rejects(access(marker));
+  assert.match(output, /-before/);
+  assert.match(output, /\+after/);
+});
+
+test("runner rejects a relative trusted Git executable override", async () => {
+  const moduleUrl = new URL("../src/diff-collector.js", import.meta.url).href;
+  const script = `
+    process.env.TRUSTGATE_GIT_EXECUTABLE = "git";
+    const { runGitDiffProcess } = await import(${JSON.stringify(moduleUrl)});
+    try {
+      await runGitDiffProcess("/tmp", "selected.txt");
+      process.exitCode = 2;
+    } catch (error) {
+      process.stdout.write(String(error));
+    }
+  `;
+
+  const result = await execa(
+    process.execPath,
+    ["--import", "tsx", "--eval", script],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, TRUSTGATE_GIT_EXECUTABLE: "git" },
+      preferLocal: false,
+    },
+  );
+
+  assert.match(result.stdout, /Git executable.*absolute/);
+});
+
+test("runner accepts a trusted absolute Git executable override", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-absolute-git-"));
+  const wrapperDirectory = await mkdtemp(join(tmpdir(), "trustgate-git-wrapper-"));
+  const wrapper = join(wrapperDirectory, "git");
+  const marker = join(wrapperDirectory, "GIT_WRAPPER_EXECUTED");
+  t.after(async () => {
+    await Promise.all([
+      rm(repo, { recursive: true, force: true }),
+      rm(wrapperDirectory, { recursive: true, force: true }),
+    ]);
+  });
+  await initializeRepository(repo);
+  await writeFile(join(repo, "selected.txt"), "before\n");
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "selected.txt"), "after\n");
+  await writeFile(
+    wrapper,
+    `#!/bin/sh\nprintf '%s\\0' "$@" >> ${JSON.stringify(marker)}\nexec /usr/bin/git "$@"\n`,
     { mode: 0o755 },
   );
 
-  const output = await runGitDiffProcess(repo, "selected.txt");
-  const hostileExecuted = await access(marker).then(
-    () => true,
-    () => false,
+  const moduleUrl = new URL("../src/diff-collector.js", import.meta.url).href;
+  const script = `
+    const { runGitDiffProcess } = await import(${JSON.stringify(moduleUrl)});
+    process.stdout.write(await runGitDiffProcess(${JSON.stringify(repo)}, "selected.txt"));
+  `;
+  const result = await execa(
+    process.execPath,
+    ["--import", "tsx", "--eval", script],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, TRUSTGATE_GIT_EXECUTABLE: wrapper },
+      preferLocal: false,
+    },
   );
+  const invokedArguments = (await readFile(marker)).toString("utf8");
 
-  assert.equal(hostileExecuted, false);
-  assert.match(output, /-before/);
-  assert.match(output, /\+after/);
+  assert.match(result.stdout, /-before/);
+  assert.match(result.stdout, /\+after/);
+  assert.match(invokedArguments, /--no-lazy-fetch\0/);
+  assert.match(invokedArguments, /--no-replace-objects\0/);
+  assert.match(invokedArguments, /protocol\.ext\.allow=never\0/);
 });
 
 test("target diff.external is never executed", async (t) => {
@@ -576,6 +694,170 @@ test("collector includes added and deleted regular files", async (t) => {
   );
 });
 
+test("runner emits evidence for executable-bit-only changes", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-mode-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "script.sh"), "#!/bin/sh\n", { mode: 0o644 });
+  await execa("git", ["add", "--", "script.sh"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await chmod(join(repo, "script.sh"), 0o755);
+
+  const output = await runGitDiffProcess(repo, "script.sh");
+
+  assert.match(output, /old mode 100644/);
+  assert.match(output, /new mode 100755/);
+  assert.match(output, /diff --git a\/script\.sh b\/script\.sh/);
+});
+
+test("runner emits headers for empty added and deleted files", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-empty-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "deleted-empty.txt"), "");
+  await execa("git", ["add", "--", "deleted-empty.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await rm(join(repo, "deleted-empty.txt"));
+  await writeFile(join(repo, "added-empty.txt"), "");
+
+  const [added, deleted] = await Promise.all([
+    runGitDiffProcess(repo, "added-empty.txt"),
+    runGitDiffProcess(repo, "deleted-empty.txt"),
+  ]);
+
+  assert.match(added, /new file mode 100644/);
+  assert.match(added, /diff --git a\/added-empty\.txt b\/added-empty\.txt/);
+  assert.match(deleted, /deleted file mode 100644/);
+  assert.match(
+    deleted,
+    /diff --git a\/deleted-empty\.txt b\/deleted-empty\.txt/,
+  );
+});
+
+test("opened-file containment rejects an outside descriptor", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "trustgate-fd-root-"));
+  const outside = await mkdtemp(join(tmpdir(), "trustgate-fd-outside-"));
+  t.after(async () => {
+    await Promise.all([
+      rm(root, { recursive: true, force: true }),
+      rm(outside, { recursive: true, force: true }),
+    ]);
+  });
+  const candidate = join(root, "selected.txt");
+  const outsideFile = join(outside, "selected.txt");
+  await writeFile(candidate, "inside\n");
+  await writeFile(outsideFile, "outside\n");
+  const initialStat = await lstat(candidate);
+  const handle = await open(outsideFile, "r");
+  t.after(async () => handle.close());
+
+  await assert.rejects(
+    assertOpenedFileContained(root, candidate, handle, initialStat),
+    /opened review file.*outside|changed while opening/,
+  );
+});
+
+test("opened-file containment accepts the matching inside descriptor", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "trustgate-fd-inside-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const candidate = join(root, "selected.txt");
+  await writeFile(candidate, "inside\n");
+  const initialStat = await lstat(candidate);
+  const handle = await open(candidate, "r");
+  t.after(async () => handle.close());
+
+  const openedStat = await assertOpenedFileContained(
+    root,
+    candidate,
+    handle,
+    initialStat,
+  );
+
+  assert.equal(openedStat.dev, initialStat.dev);
+  assert.equal(openedStat.ino, initialStat.ino);
+});
+
+test("runner rejects non-NUL invalid UTF-8 worktree content", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-invalid-utf8-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "selected.txt"), "valid before\n");
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(
+    join(repo, "selected.txt"),
+    Buffer.from([0x76, 0x61, 0x6c, 0x69, 0x64, 0x20, 0xc3, 0x28, 0x0a]),
+  );
+
+  await assert.rejects(
+    runGitDiffProcess(repo, "selected.txt"),
+    /invalid UTF-8/,
+  );
+});
+
+test("runner rejects non-NUL invalid UTF-8 HEAD content", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-invalid-head-utf8-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(
+    join(repo, "selected.txt"),
+    Buffer.from([0x68, 0x65, 0x61, 0x64, 0x20, 0xc3, 0x28, 0x0a]),
+  );
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "selected.txt"), "valid after\n");
+
+  await assert.rejects(
+    runGitDiffProcess(repo, "selected.txt"),
+    /invalid UTF-8/,
+  );
+});
+
+test("runner preserves deterministic binary evidence for NUL content", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-binary-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "selected.bin"), Buffer.from([0, 1, 2]));
+  await execa("git", ["add", "--", "selected.bin"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "selected.bin"), Buffer.from([0, 1, 3]));
+
+  const output = await runGitDiffProcess(repo, "selected.bin");
+
+  assert.match(output, /Binary files .* differ/);
+  assert.doesNotMatch(output, /\uFFFD/);
+});
+
 test("runner rejects symlinks, intermediate escapes, and gitlinks", async (t) => {
   const repo = await mkdtemp(join(tmpdir(), "trustgate-special-path-"));
   const outside = await mkdtemp(join(tmpdir(), "trustgate-special-outside-"));
@@ -694,18 +976,66 @@ test("runner enforces raw byte caps for HEAD and worktree content", async (t) =>
   );
 });
 
-test("runner supports SHA-256 repositories and linked worktrees", async (t) => {
-  const shaRepo = await mkdtemp(join(tmpdir(), "trustgate-sha256-diff-"));
-  const mainRepo = await mkdtemp(join(tmpdir(), "trustgate-main-worktree-"));
-  const linked = await mkdtemp(join(tmpdir(), "trustgate-linked-worktree-"));
-  await rm(linked, { recursive: true, force: true });
-  t.after(async () => {
-    await Promise.all([
-      rm(shaRepo, { recursive: true, force: true }),
-      rm(mainRepo, { recursive: true, force: true }),
-      rm(linked, { recursive: true, force: true }),
-    ]);
+test("runner rejects object alternates before object access", async (t) => {
+  for (const alternateName of ["alternates", "http-alternates"]) {
+    await t.test(alternateName, async (t) => {
+      const repo = await mkdtemp(join(tmpdir(), "trustgate-alternates-diff-"));
+      t.after(async () => rm(repo, { recursive: true, force: true }));
+      await initializeRepository(repo);
+      await writeFile(join(repo, "selected.txt"), "before\n");
+      await execa("git", ["add", "--", "selected.txt"], {
+        cwd: repo,
+        preferLocal: false,
+      });
+      await execa("git", ["commit", "--quiet", "-m", "initial"], {
+        cwd: repo,
+        preferLocal: false,
+      });
+      await writeFile(join(repo, "selected.txt"), "after\n");
+      await mkdir(join(repo, ".git", "objects", "info"), { recursive: true });
+      await writeFile(
+        join(repo, ".git", "objects", "info", alternateName),
+        alternateName === "alternates"
+          ? "/definitely/not/an/object/directory\n"
+          : "https://example.invalid/objects\n",
+      );
+
+      await assert.rejects(
+        runGitDiffProcess(repo, "selected.txt"),
+        /object alternates are not allowed/,
+      );
+    });
+  }
+});
+
+test("runner rejects dangling object-alternate symlinks", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-alternate-link-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "selected.txt"), "before\n");
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: repo,
+    preferLocal: false,
   });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await mkdir(join(repo, ".git", "objects", "info"), { recursive: true });
+  await symlink(
+    "/definitely/missing/alternates",
+    join(repo, ".git", "objects", "info", "alternates"),
+  );
+
+  await assert.rejects(
+    runGitDiffProcess(repo, "selected.txt"),
+    /object alternates are not allowed/,
+  );
+});
+
+test("runner supports normal SHA-256 repositories", async (t) => {
+  const shaRepo = await mkdtemp(join(tmpdir(), "trustgate-sha256-diff-"));
+  t.after(async () => rm(shaRepo, { recursive: true, force: true }));
 
   const shaOptions = { cwd: shaRepo, preferLocal: false } as const;
   await execa("git", ["init", "--quiet", "--object-format=sha256"], shaOptions);
@@ -716,6 +1046,22 @@ test("runner supports SHA-256 repositories and linked worktrees", async (t) => {
   await execa("git", ["commit", "--quiet", "-m", "initial"], shaOptions);
   await writeFile(join(shaRepo, "selected.txt"), "after sha256\n");
 
+  const shaOutput = await runGitDiffProcess(shaRepo, "selected.txt");
+
+  assert.match(shaOutput, /-before sha256/);
+  assert.match(shaOutput, /\+after sha256/);
+});
+
+test("runner rejects linked worktree Git-file indirection", async (t) => {
+  const mainRepo = await mkdtemp(join(tmpdir(), "trustgate-main-worktree-"));
+  const linked = await mkdtemp(join(tmpdir(), "trustgate-linked-worktree-"));
+  await rm(linked, { recursive: true, force: true });
+  t.after(async () => {
+    await Promise.all([
+      rm(mainRepo, { recursive: true, force: true }),
+      rm(linked, { recursive: true, force: true }),
+    ]);
+  });
   await initializeRepository(mainRepo);
   await writeFile(join(mainRepo, "selected.txt"), "before linked\n");
   await execa("git", ["add", "--", "selected.txt"], {
@@ -731,15 +1077,48 @@ test("runner supports SHA-256 repositories and linked worktrees", async (t) => {
     ["worktree", "add", "--quiet", "--detach", linked, "HEAD"],
     { cwd: mainRepo, preferLocal: false },
   );
-  await writeFile(join(linked, "selected.txt"), "after linked\n");
 
-  const [shaOutput, linkedOutput] = await Promise.all([
-    runGitDiffProcess(shaRepo, "selected.txt"),
+  await assert.rejects(
     runGitDiffProcess(linked, "selected.txt"),
-  ]);
+    /\.git.*real directory|Git directory/,
+  );
+});
 
-  assert.match(shaOutput, /-before sha256/);
-  assert.match(shaOutput, /\+after sha256/);
-  assert.match(linkedOutput, /-before linked/);
-  assert.match(linkedOutput, /\+after linked/);
+test("runner rejects .git symlinks and arbitrary Git-file indirection", async (t) => {
+  const source = await mkdtemp(join(tmpdir(), "trustgate-gitdir-source-"));
+  const symlinkRepo = await mkdtemp(join(tmpdir(), "trustgate-gitdir-symlink-"));
+  const fileRepo = await mkdtemp(join(tmpdir(), "trustgate-gitdir-file-"));
+  t.after(async () => {
+    await Promise.all([
+      rm(source, { recursive: true, force: true }),
+      rm(symlinkRepo, { recursive: true, force: true }),
+      rm(fileRepo, { recursive: true, force: true }),
+    ]);
+  });
+  await initializeRepository(source);
+  await writeFile(join(source, "selected.txt"), "tracked\n");
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: source,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: source,
+    preferLocal: false,
+  });
+  await symlink(join(source, ".git"), join(symlinkRepo, ".git"));
+  await writeFile(
+    join(fileRepo, ".git"),
+    `gitdir: ${join(source, ".git")}\n`,
+  );
+  await writeFile(join(symlinkRepo, "selected.txt"), "changed\n");
+  await writeFile(join(fileRepo, "selected.txt"), "changed\n");
+
+  await assert.rejects(
+    runGitDiffProcess(symlinkRepo, "selected.txt"),
+    /\.git.*real directory|Git directory/,
+  );
+  await assert.rejects(
+    runGitDiffProcess(fileRepo, "selected.txt"),
+    /\.git.*real directory|Git directory/,
+  );
 });

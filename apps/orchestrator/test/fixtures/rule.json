@@ -1,0 +1,12 @@
+{
+  "schema_version": "1",
+  "groups": [
+    {
+      "group_id": 1,
+      "source": "project",
+      "pattern": "**/*.ts",
+      "files": ["src/routes/purchase.ts"],
+      "rule": "never trust client price"
+    }
+  ]
+}

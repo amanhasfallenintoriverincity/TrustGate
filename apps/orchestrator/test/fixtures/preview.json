@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "mode": "workspace",
+  "repository": "/repo",
+  "total_files": 1,
+  "reviewable_count": 1,
+  "excluded_count": 0,
+  "total_insertions": 4,
+  "total_deletions": 1,
+  "reviewable_files": [
+    {
+      "path": "src/routes/purchase.ts",
+      "status": "modified",
+      "insertions": 4,
+      "deletions": 1
+    }
+  ],
+  "excluded_files": []
+}

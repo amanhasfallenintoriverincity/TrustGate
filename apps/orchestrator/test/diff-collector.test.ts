@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -166,50 +173,54 @@ test("collector preserves UTF-8 boundaries at the remaining total budget", async
     result.reduce((total, { diff }) => total + byteLength(diff), 0),
     TOTAL_DIFF_BYTES,
   );
-  assert.deepEqual(calls, files.slice(0, 4).map(({ path }) => path));
+  assert.deepEqual(
+    calls,
+    files.slice(0, 4).map(({ path }) => path),
+  );
 });
 
 test("collector validates the complete path list before invoking the runner", async () => {
-  const invalidCases: Array<{ name: string; paths: string[]; error: RegExp }> = [
-    { name: "empty", paths: ["src/safe.ts", ""], error: /non-empty/ },
-    { name: "repository root", paths: ["src/safe.ts", "."], error: /root/ },
-    {
-      name: "outside repository",
-      paths: ["src/safe.ts", "../secret"],
-      error: /outside/,
-    },
-    {
-      name: "absolute",
-      paths: ["src/safe.ts", "/tmp/absolute.ts"],
-      error: /absolute/,
-    },
-    {
-      name: "NUL",
-      paths: ["src/safe.ts", "src/bad\0name.ts"],
-      error: /NUL/,
-    },
-    {
-      name: "normalized duplicate",
-      paths: ["src/a.ts", "src/other/../a.ts"],
-      error: /duplicate/,
-    },
-  ];
+  const invalidCases: Array<{ name: string; paths: string[]; error: RegExp }> =
+    [
+      { name: "empty", paths: ["src/safe.ts", ""], error: /non-empty/ },
+      { name: "repository root", paths: ["src/safe.ts", "."], error: /root/ },
+      {
+        name: "outside repository",
+        paths: ["src/safe.ts", "../secret"],
+        error: /outside/,
+      },
+      {
+        name: "absolute",
+        paths: ["src/safe.ts", "/tmp/absolute.ts"],
+        error: /absolute/,
+      },
+      {
+        name: "NUL",
+        paths: ["src/safe.ts", "src/bad\0name.ts"],
+        error: /NUL/,
+      },
+      {
+        name: "normalized duplicate",
+        paths: ["src/a.ts", "src/other/../a.ts"],
+        error: /duplicate/,
+      },
+    ];
 
   for (const { name, paths, error } of invalidCases) {
     let calls = 0;
     await assert.rejects(
-      collectDiffs(
-        "/repo",
-        paths.map(reviewFile),
-        async () => {
-          calls += 1;
-          return "diff";
-        },
-      ),
+      collectDiffs("/repo", paths.map(reviewFile), async () => {
+        calls += 1;
+        return "diff";
+      }),
       error,
       name,
     );
-    assert.equal(calls, 0, `${name}: runner was called before validation ended`);
+    assert.equal(
+      calls,
+      0,
+      `${name}: runner was called before validation ended`,
+    );
   }
 });
 
@@ -241,11 +252,7 @@ test("collector rejects secret-like basenames anywhere in the repository", async
 });
 
 test("collector accepts safe basenames that only resemble secret patterns", async () => {
-  const paths = [
-    "src/.environment.ts",
-    "src/auth.json.ts",
-    "docs/keynote.ts",
-  ];
+  const paths = ["src/.environment.ts", "src/auth.json.ts", "docs/keynote.ts"];
   const calls: string[] = [];
 
   const result = await collectDiffs(
@@ -308,9 +315,10 @@ test("runGitDiffProcess treats a wildcard path as a literal filename", async (t)
   });
   await initializeRepository(repo);
 
+  await writeFile(join(repo, "*.txt"), "literal before\n");
   await writeFile(join(repo, "safe.txt"), "safe before\n");
   await writeFile(join(repo, ".env"), "secret before\n");
-  await execa("git", ["add", "--", "safe.txt", ".env"], {
+  await execa("git", ["add", "--", "*.txt", "safe.txt", ".env"], {
     cwd: repo,
     preferLocal: false,
   });
@@ -318,14 +326,16 @@ test("runGitDiffProcess treats a wildcard path as a literal filename", async (t)
     cwd: repo,
     preferLocal: false,
   });
+  await writeFile(join(repo, "*.txt"), "literal after\n");
   await writeFile(join(repo, "safe.txt"), "safe after\n");
   await writeFile(join(repo, ".env"), "secret after\n");
 
   const output = await runGitDiffProcess(repo, "*.txt");
 
-  assert.doesNotMatch(output, /safe\.txt/);
-  assert.doesNotMatch(output, /\.env/);
-  assert.equal(output, "");
+  assert.match(output, /-literal before/);
+  assert.match(output, /\+literal after/);
+  assert.doesNotMatch(output, /safe (?:before|after)/);
+  assert.doesNotMatch(output, /secret (?:before|after)/);
 });
 
 test("runGitDiffProcess treats exclude magic as a literal filename", async (t) => {
@@ -335,24 +345,28 @@ test("runGitDiffProcess treats exclude magic as a literal filename", async (t) =
   });
   await initializeRepository(repo);
 
+  await writeFile(join(repo, ":(exclude)safe.txt"), "literal before\n");
   await writeFile(join(repo, "safe.txt"), "safe before\n");
   await writeFile(join(repo, ".env"), "secret before\n");
-  await execa("git", ["add", "--", "safe.txt", ".env"], {
-    cwd: repo,
-    preferLocal: false,
-  });
+  await execa(
+    "git",
+    ["add", "--", ":(literal):(exclude)safe.txt", "safe.txt", ".env"],
+    { cwd: repo, preferLocal: false },
+  );
   await execa("git", ["commit", "--quiet", "-m", "initial"], {
     cwd: repo,
     preferLocal: false,
   });
+  await writeFile(join(repo, ":(exclude)safe.txt"), "literal after\n");
   await writeFile(join(repo, "safe.txt"), "safe after\n");
   await writeFile(join(repo, ".env"), "secret after\n");
 
   const output = await runGitDiffProcess(repo, ":(exclude)safe.txt");
 
-  assert.doesNotMatch(output, /\.env/);
-  assert.doesNotMatch(output, /safe\.txt/);
-  assert.equal(output, "");
+  assert.match(output, /-literal before/);
+  assert.match(output, /\+literal after/);
+  assert.doesNotMatch(output, /safe (?:before|after)/);
+  assert.doesNotMatch(output, /secret (?:before|after)/);
 });
 
 test("runGitDiffProcess passes an option-like path after Git's option terminator", async (t) => {
@@ -377,10 +391,9 @@ test("runGitDiffProcess passes an option-like path after Git's option terminator
 
   const output = await runGitDiffProcess(repo, "--help");
 
-  assert.match(output, /diff --git a\/--help b\/--help/);
   assert.match(output, /-before/);
   assert.match(output, /\+after/);
-  assert.doesNotMatch(output, /other\.txt/);
+  assert.doesNotMatch(output, /other (?:before|after)/);
 });
 
 test("runGitDiffProcess does not resolve Git from the target repository", async (t) => {
@@ -417,5 +430,316 @@ test("runGitDiffProcess does not resolve Git from the target repository", async 
   );
 
   assert.equal(hostileExecuted, false);
-  assert.match(output, /diff --git a\/selected\.txt b\/selected\.txt/);
+  assert.match(output, /-before/);
+  assert.match(output, /\+after/);
+});
+
+test("target diff.external is never executed", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-external-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "selected.txt"), "before\n");
+  await writeFile(join(repo, ".env"), "EXTERNAL_DIFF_SECRET\n");
+  await execa("git", ["add", "--", "selected.txt", ".env"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "selected.txt"), "after\n");
+  const marker = join(repo, "EXTERNAL_DIFF_EXECUTED");
+  const helper = join(repo, "external.cjs");
+  await writeFile(
+    helper,
+    `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");\nprocess.stdout.write(require("node:fs").readFileSync(".env"));\n`,
+    { mode: 0o755 },
+  );
+  await execa("git", ["config", "diff.external", helper], {
+    cwd: repo,
+    preferLocal: false,
+  });
+
+  const output = await runGitDiffProcess(repo, "selected.txt");
+
+  await assert.rejects(access(marker));
+  assert.doesNotMatch(output, /EXTERNAL_DIFF_SECRET/);
+  assert.match(output, /-before/);
+  assert.match(output, /\+after/);
+});
+
+test("target attributes and clean filters are never executed", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-attributes-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  const marker = join(repo, "ATTRIBUTE_HELPER_EXECUTED");
+  const helper = join(repo, "filter.cjs");
+  await writeFile(
+    helper,
+    `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");\nprocess.stdin.pipe(process.stdout);\n`,
+    { mode: 0o755 },
+  );
+  await writeFile(
+    join(repo, ".gitattributes"),
+    "selected.txt filter=hostile diff=hostile\n",
+  );
+  await writeFile(join(repo, "selected.txt"), "raw before\n");
+  await execa(
+    "git",
+    [
+      "-c",
+      `filter.hostile.clean=${helper}`,
+      "-c",
+      "filter.hostile.required=true",
+      "add",
+      "--",
+      ".gitattributes",
+      "selected.txt",
+    ],
+    { cwd: repo, preferLocal: false },
+  );
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await rm(marker, { force: true });
+  await execa("git", ["config", "filter.hostile.clean", helper], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["config", "filter.hostile.required", "true"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["config", "diff.hostile.command", helper], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "selected.txt"), "raw after\n");
+
+  const output = await runGitDiffProcess(repo, "selected.txt");
+
+  await assert.rejects(access(marker));
+  assert.match(output, /-raw before/);
+  assert.match(output, /\+raw after/);
+});
+
+test("collector rejects directory paths without leaking descendants", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-directory-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await mkdir(join(repo, "selected"));
+  await writeFile(join(repo, "selected", "safe.txt"), "safe\n");
+  await writeFile(join(repo, "selected", ".env"), "DIRECTORY_SECRET\n");
+  await execa("git", ["add", "--", "selected"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+
+  await assert.rejects(
+    collectDiffs(repo, [reviewFile("selected/")]),
+    /regular|blob/,
+  );
+});
+
+test("collector includes added and deleted regular files", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-add-delete-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "deleted.txt"), "removed content\n");
+  await execa("git", ["add", "--", "deleted.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await rm(join(repo, "deleted.txt"));
+  await writeFile(join(repo, "added.txt"), "new content\n");
+
+  const result = await collectDiffs(repo, [
+    { ...reviewFile("added.txt"), status: "added" },
+    { ...reviewFile("deleted.txt"), status: "deleted" },
+  ]);
+
+  assert.match(result[0]!.diff, /\+new content/);
+  assert.match(result[1]!.diff, /-removed content/);
+  assert.deepEqual(
+    result.map(({ truncated }) => truncated),
+    [false, false],
+  );
+});
+
+test("runner rejects symlinks, intermediate escapes, and gitlinks", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-special-path-"));
+  const outside = await mkdtemp(join(tmpdir(), "trustgate-special-outside-"));
+  const child = await mkdtemp(join(tmpdir(), "trustgate-special-child-"));
+  t.after(async () => {
+    await Promise.all([
+      rm(repo, { recursive: true, force: true }),
+      rm(outside, { recursive: true, force: true }),
+      rm(child, { recursive: true, force: true }),
+    ]);
+  });
+  await initializeRepository(repo);
+  await initializeRepository(child);
+  await writeFile(join(child, "child.txt"), "child\n");
+  await execa("git", ["add", "--", "child.txt"], {
+    cwd: child,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "child"], {
+    cwd: child,
+    preferLocal: false,
+  });
+  const childHead = (
+    await execa("git", ["rev-parse", "HEAD"], {
+      cwd: child,
+      preferLocal: false,
+    })
+  ).stdout;
+  await mkdir(join(repo, "escape"));
+  await writeFile(join(repo, "escape", "secret.txt"), "safe\n");
+  await symlink(join(outside, "secret.txt"), join(repo, "tracked-link"));
+  await execa("git", ["add", "--", "escape/secret.txt", "tracked-link"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa(
+    "git",
+    ["update-index", "--add", "--cacheinfo", "160000", childHead, "module"],
+    { cwd: repo, preferLocal: false },
+  );
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await rm(join(repo, "escape"), { recursive: true });
+  await writeFile(join(outside, "secret.txt"), "OUTSIDE_SECRET\n");
+  await symlink(outside, join(repo, "escape"));
+  await symlink(join(outside, "secret.txt"), join(repo, "untracked-link"));
+
+  await assert.rejects(runGitDiffProcess(repo, "tracked-link"), /regular|blob/);
+  await assert.rejects(
+    runGitDiffProcess(repo, "untracked-link"),
+    /regular|blob|outside repository/,
+  );
+  await assert.rejects(runGitDiffProcess(repo, "module"), /regular Git blob/);
+  await assert.rejects(
+    runGitDiffProcess(repo, "escape/secret.txt"),
+    /outside repository/,
+  );
+});
+
+test("target core.fsmonitor helper is never executed", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-fsmonitor-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "selected.txt"), "before\n");
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "selected.txt"), "after\n");
+  const marker = join(repo, "FSMONITOR_EXECUTED");
+  const helper = join(repo, "fsmonitor.cjs");
+  await writeFile(
+    helper,
+    `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");\nprocess.stdout.write("\\n");\n`,
+    { mode: 0o755 },
+  );
+  await execa("git", ["config", "core.fsmonitor", helper], {
+    cwd: repo,
+    preferLocal: false,
+  });
+
+  const output = await runGitDiffProcess(repo, "selected.txt");
+
+  await assert.rejects(access(marker));
+  assert.match(output, /-before/);
+  assert.match(output, /\+after/);
+});
+
+test("runner enforces raw byte caps for HEAD and worktree content", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-large-raw-diff-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  await writeFile(join(repo, "large.txt"), Buffer.alloc(1024 * 1024 + 1));
+  await execa("git", ["add", "--", "large.txt"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await rm(join(repo, "large.txt"));
+
+  await assert.rejects(runGitDiffProcess(repo, "large.txt"));
+
+  await writeFile(join(repo, "large.txt"), Buffer.alloc(1024 * 1024 + 1));
+  await assert.rejects(
+    runGitDiffProcess(repo, "large.txt"),
+    /exceeds raw byte limit/,
+  );
+});
+
+test("runner supports SHA-256 repositories and linked worktrees", async (t) => {
+  const shaRepo = await mkdtemp(join(tmpdir(), "trustgate-sha256-diff-"));
+  const mainRepo = await mkdtemp(join(tmpdir(), "trustgate-main-worktree-"));
+  const linked = await mkdtemp(join(tmpdir(), "trustgate-linked-worktree-"));
+  await rm(linked, { recursive: true, force: true });
+  t.after(async () => {
+    await Promise.all([
+      rm(shaRepo, { recursive: true, force: true }),
+      rm(mainRepo, { recursive: true, force: true }),
+      rm(linked, { recursive: true, force: true }),
+    ]);
+  });
+
+  const shaOptions = { cwd: shaRepo, preferLocal: false } as const;
+  await execa("git", ["init", "--quiet", "--object-format=sha256"], shaOptions);
+  await execa("git", ["config", "user.email", "test@example.com"], shaOptions);
+  await execa("git", ["config", "user.name", "Test User"], shaOptions);
+  await writeFile(join(shaRepo, "selected.txt"), "before sha256\n");
+  await execa("git", ["add", "--", "selected.txt"], shaOptions);
+  await execa("git", ["commit", "--quiet", "-m", "initial"], shaOptions);
+  await writeFile(join(shaRepo, "selected.txt"), "after sha256\n");
+
+  await initializeRepository(mainRepo);
+  await writeFile(join(mainRepo, "selected.txt"), "before linked\n");
+  await execa("git", ["add", "--", "selected.txt"], {
+    cwd: mainRepo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: mainRepo,
+    preferLocal: false,
+  });
+  await execa(
+    "git",
+    ["worktree", "add", "--quiet", "--detach", linked, "HEAD"],
+    { cwd: mainRepo, preferLocal: false },
+  );
+  await writeFile(join(linked, "selected.txt"), "after linked\n");
+
+  const [shaOutput, linkedOutput] = await Promise.all([
+    runGitDiffProcess(shaRepo, "selected.txt"),
+    runGitDiffProcess(linked, "selected.txt"),
+  ]);
+
+  assert.match(shaOutput, /-before sha256/);
+  assert.match(shaOutput, /\+after sha256/);
+  assert.match(linkedOutput, /-before linked/);
+  assert.match(linkedOutput, /\+after linked/);
 });

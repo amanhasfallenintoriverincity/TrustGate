@@ -261,6 +261,40 @@ test("analysis plan rejects arbitrary commands and external URLs", () => {
     "JSON over the depth limit must be rejected",
   );
 
+  const arrayPollutionTargets = [
+    ["Object.prototype", Object.prototype],
+    ["Array.prototype", Array.prototype],
+  ] as const;
+  for (const [label, target] of arrayPollutionTargets) {
+    const previousIndex = Object.getOwnPropertyDescriptor(target, "0");
+    try {
+      Object.defineProperty(target, "0", {
+        configurable: true,
+        value: "inherited-array-value",
+        writable: true,
+      });
+      const sparseBody = new Array(1);
+      let sparseBodyResult: ReturnType<typeof analysisPlanSchema.safeParse> | undefined;
+      assert.doesNotThrow(() => {
+        sparseBodyResult = analysisPlanSchema.safeParse(planWithTest({
+          ...validTest,
+          request: { ...validTest.request, body: sparseBody },
+        }));
+      });
+      assert.equal(
+        sparseBodyResult?.success,
+        false,
+        `${label}[0] must not make a sparse JSON array valid`,
+      );
+    } finally {
+      if (previousIndex === undefined) {
+        delete (target as Record<string, unknown>)["0"];
+      } else {
+        Object.defineProperty(target, "0", previousIndex);
+      }
+    }
+  }
+
   let deeplyNestedJson: unknown = "leaf";
   for (let depth = 0; depth < 2_000; depth += 1) {
     deeplyNestedJson = [deeplyNestedJson];
@@ -365,6 +399,44 @@ test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
       delete (Object.prototype as Record<string, unknown>).evidence;
     } else {
       Object.defineProperty(Object.prototype, "evidence", previousEvidence);
+    }
+  }
+
+  const evidencePollutionTargets = [
+    ["Object.prototype", Object.prototype],
+    ["Array.prototype", Array.prototype],
+  ] as const;
+  for (const [label, target] of evidencePollutionTargets) {
+    const previousIndex = Object.getOwnPropertyDescriptor(target, "0");
+    try {
+      Object.defineProperty(target, "0", {
+        configurable: true,
+        value: validEvidence,
+        writable: true,
+      });
+      const sparseEvidence = new Array(1);
+      const sparseResult = {
+        runId: "run-1",
+        hypothesisId: "price-authority",
+        verdict: "CONFIRMED",
+        executed: true,
+        evidence: sparseEvidence,
+      };
+      let sparseEvidenceResult: ReturnType<typeof executionResultSchema.safeParse> | undefined;
+      assert.doesNotThrow(() => {
+        sparseEvidenceResult = executionResultSchema.safeParse(sparseResult);
+      });
+      assert.equal(
+        sparseEvidenceResult?.success,
+        false,
+        `${label}[0] must not make sparse execution evidence valid`,
+      );
+    } finally {
+      if (previousIndex === undefined) {
+        delete (target as Record<string, unknown>)["0"];
+      } else {
+        Object.defineProperty(target, "0", previousIndex);
+      }
     }
   }
 

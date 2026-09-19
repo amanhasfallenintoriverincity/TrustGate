@@ -66,6 +66,42 @@ const plainStrictObject = <
   );
 };
 
+const denseArray = <Element extends z.ZodTypeAny>(
+  elementSchema: Element,
+  options: { min?: number; max: number },
+): z.ZodType<z.output<Element>[]> => {
+  let arraySchema = z.array(elementSchema);
+  if (options.min !== undefined) {
+    arraySchema = arraySchema.min(options.min);
+  }
+  arraySchema = arraySchema.max(options.max);
+
+  return z.preprocess(
+    (value, ctx) => {
+      if (!Array.isArray(value)) {
+        return value;
+      }
+
+      if (value.length > options.max) {
+        return value;
+      }
+
+      for (let index = 0; index < value.length; index += 1) {
+        if (!Object.hasOwn(value, index)) {
+          ctx.addIssue({
+            code: "custom",
+            message: "Array items must be own properties",
+            path: [index],
+          });
+          return z.NEVER;
+        }
+      }
+      return value;
+    },
+    arraySchema,
+  );
+};
+
 const buildJsonValueSchema = (depth: number): z.ZodType<JsonValue> => {
   const scalarSchema = z.union([
     z.string().max(JSON_MAX_STRING_LENGTH),
@@ -88,7 +124,7 @@ const buildJsonValueSchema = (depth: number): z.ZodType<JsonValue> => {
 
   return z.union([
     scalarSchema,
-    z.array(childSchema).max(JSON_MAX_ARRAY_LENGTH),
+    denseArray(childSchema, { max: JSON_MAX_ARRAY_LENGTH }),
     recordSchema,
   ]);
 };
@@ -130,7 +166,7 @@ export const assertionSchema = z.union([
 export const testSpecSchema = plainStrictObject({
   id: z.string().regex(/^[a-z0-9-]{3,64}$/),
   request: requestSchema,
-  assertions: z.array(assertionSchema).min(1).max(8),
+  assertions: denseArray(assertionSchema, { min: 1, max: 8 }),
 });
 
 const sourceEvidenceSchema = plainStrictObject({
@@ -144,13 +180,13 @@ const hypothesisSchema = plainStrictObject({
   title: z.string().min(3).max(120),
   category: z.enum(["price-tampering", "ownership-bypass", "authorization-bypass"]),
   severity: z.enum(["critical", "high", "medium"]),
-  evidence: z.array(sourceEvidenceSchema).min(1).max(8),
-  tests: z.array(testSpecSchema).min(1).max(5),
+  evidence: denseArray(sourceEvidenceSchema, { min: 1, max: 8 }),
+  tests: denseArray(testSpecSchema, { min: 1, max: 5 }),
 });
 
 export const analysisPlanSchema = plainStrictObject({
   version: z.literal(1),
-  hypotheses: z.array(hypothesisSchema).min(1).max(10),
+  hypotheses: denseArray(hypothesisSchema, { min: 1, max: 10 }),
 });
 
 const executionEvidenceSchema = plainStrictObject({
@@ -164,7 +200,7 @@ export const executionResultSchema = plainStrictObject({
   hypothesisId: z.string().min(1).max(64),
   verdict: z.enum(["CONFIRMED", "BLOCKED", "UNVERIFIED", "ERROR"]),
   executed: z.boolean(),
-  evidence: z.array(executionEvidenceSchema).max(64),
+  evidence: denseArray(executionEvidenceSchema, { max: 64 }),
 }).superRefine((value, ctx) => {
   if (value.verdict === "CONFIRMED" && !value.executed) {
     ctx.addIssue({

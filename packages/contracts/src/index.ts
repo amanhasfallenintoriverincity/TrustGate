@@ -27,8 +27,44 @@ const plainObjectInputSchema = z.custom<Record<string, unknown>>(
   { message: "Expected a plain object" },
 );
 
-const plainStrictObject = <Shape extends z.ZodRawShape>(shape: Shape) =>
-  plainObjectInputSchema.pipe(z.object(shape).strict());
+const plainStrictObject = <
+  Shape extends z.ZodRawShape,
+  OptionalKey extends keyof Shape = never,
+>(shape: Shape, optionalKeys: readonly OptionalKey[] = []) => {
+  const optionalKeySet = new Set<PropertyKey>(optionalKeys);
+  const requiredKeys = Object.keys(shape).filter((key) => !optionalKeySet.has(key));
+
+  return z.preprocess(
+    (value, ctx) => {
+      if (!isPlainObject(value)) {
+        ctx.addIssue({ code: "custom", message: "Expected a plain object" });
+        return z.NEVER;
+      }
+
+      let missingRequiredKey = false;
+      for (const key of requiredKeys) {
+        if (!Object.hasOwn(value, key)) {
+          missingRequiredKey = true;
+          ctx.addIssue({
+            code: "custom",
+            message: `Required field must be an own property: ${key}`,
+            path: [key],
+          });
+        }
+      }
+      if (missingRequiredKey) {
+        return z.NEVER;
+      }
+
+      const ownValue = Object.create(null) as Record<string, unknown>;
+      for (const key of Object.keys(value)) {
+        ownValue[key] = value[key];
+      }
+      return ownValue;
+    },
+    z.object(shape).strict(),
+  );
+};
 
 const buildJsonValueSchema = (depth: number): z.ZodType<JsonValue> => {
   const scalarSchema = z.union([
@@ -61,9 +97,9 @@ export const jsonValueSchema: z.ZodType<JsonValue> = buildJsonValueSchema(JSON_M
 
 export const requestSchema = plainStrictObject({
   method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
-  path: z.string().regex(/^\/api\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/),
+  path: z.string().max(512).regex(/^\/api\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/),
   body: jsonValueSchema.optional(),
-}).refine(
+}, ["body"]).refine(
   (value) => !(Object.hasOwn(value, "body") && value.body === undefined),
   { message: "Explicit undefined request bodies are not allowed", path: ["body"] },
 );
@@ -128,7 +164,7 @@ export const executionResultSchema = plainStrictObject({
   hypothesisId: z.string().min(1).max(64),
   verdict: z.enum(["CONFIRMED", "BLOCKED", "UNVERIFIED", "ERROR"]),
   executed: z.boolean(),
-  evidence: z.array(executionEvidenceSchema),
+  evidence: z.array(executionEvidenceSchema).max(64),
 }).superRefine((value, ctx) => {
   if (value.verdict === "CONFIRMED" && !value.executed) {
     ctx.addIssue({

@@ -117,6 +117,78 @@ test("analysis plan rejects arbitrary commands and external URLs", () => {
     "duplicate slash must be rejected",
   );
 
+  const pathAtLimitPlan = planWithTest({
+    ...validTest,
+    request: { ...validTest.request, path: `/api/${"a".repeat(507)}` },
+  });
+  assert.equal(
+    analysisPlanSchema.safeParse(pathAtLimitPlan).success,
+    true,
+    "512-character request paths must be accepted",
+  );
+
+  const overlongPathPlan = planWithTest({
+    ...validTest,
+    request: { ...validTest.request, path: `/api/${"a".repeat(508)}` },
+  });
+  assert.equal(
+    analysisPlanSchema.safeParse(overlongPathPlan).success,
+    false,
+    "request paths over 512 characters must be rejected",
+  );
+
+  const previousMethod = Object.getOwnPropertyDescriptor(Object.prototype, "method");
+  try {
+    Object.defineProperty(Object.prototype, "method", {
+      configurable: true,
+      value: "POST",
+      writable: true,
+    });
+    const pollutedMethodPlan = planWithTest({
+      ...validTest,
+      request: { path: "/api/purchase" },
+    });
+    assert.equal(
+      analysisPlanSchema.safeParse(pollutedMethodPlan).success,
+      false,
+      "Object.prototype.method must not satisfy an own method requirement",
+    );
+  } finally {
+    if (previousMethod === undefined) {
+      delete (Object.prototype as Record<string, unknown>).method;
+    } else {
+      Object.defineProperty(Object.prototype, "method", previousMethod);
+    }
+  }
+
+  const previousBody = Object.getOwnPropertyDescriptor(Object.prototype, "body");
+  try {
+    Object.defineProperty(Object.prototype, "body", {
+      configurable: true,
+      value: { poisoned: true },
+      writable: true,
+    });
+    const inheritedBodyPlan = planWithTest({
+      ...validTest,
+      request: { method: "POST", path: "/api/purchase" },
+    });
+    const inheritedBodyResult = analysisPlanSchema.safeParse(inheritedBodyPlan);
+    assert.equal(inheritedBodyResult.success, true, "inherited optional body must be ignored");
+    if (inheritedBodyResult.success) {
+      assert.equal(
+        Object.hasOwn(inheritedBodyResult.data.hypotheses[0]!.tests[0]!.request, "body"),
+        false,
+        "inherited optional body must not appear in parsed data",
+      );
+    }
+  } finally {
+    if (previousBody === undefined) {
+      delete (Object.prototype as Record<string, unknown>).body;
+    } else {
+      Object.defineProperty(Object.prototype, "body", previousBody);
+    }
+  }
+
   const inheritedMethodRequest = Object.assign(
     Object.create({ method: "POST" }) as Record<string, unknown>,
     { path: "/api/purchase", body: { itemId: "sword", price: -100 } },
@@ -205,6 +277,7 @@ test("analysis plan rejects arbitrary commands and external URLs", () => {
 });
 
 test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
+  const validEvidence = { kind: "status", expected: 400, actual: 400 };
   const unexecuted = {
     runId: "run-1",
     hypothesisId: "price-authority",
@@ -241,5 +314,80 @@ test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
     executionResultSchema.safeParse(inheritedExecuted).success,
     false,
     "inherited executed must be rejected",
+  );
+
+  const previousExecuted = Object.getOwnPropertyDescriptor(Object.prototype, "executed");
+  try {
+    Object.defineProperty(Object.prototype, "executed", {
+      configurable: true,
+      value: true,
+      writable: true,
+    });
+    const pollutedExecuted = {
+      runId: "run-1",
+      hypothesisId: "price-authority",
+      verdict: "CONFIRMED",
+      evidence: [validEvidence],
+    };
+    assert.equal(
+      executionResultSchema.safeParse(pollutedExecuted).success,
+      false,
+      "Object.prototype.executed must not satisfy an own executed requirement",
+    );
+  } finally {
+    if (previousExecuted === undefined) {
+      delete (Object.prototype as Record<string, unknown>).executed;
+    } else {
+      Object.defineProperty(Object.prototype, "executed", previousExecuted);
+    }
+  }
+
+  const previousEvidence = Object.getOwnPropertyDescriptor(Object.prototype, "evidence");
+  try {
+    Object.defineProperty(Object.prototype, "evidence", {
+      configurable: true,
+      value: [validEvidence],
+      writable: true,
+    });
+    const pollutedEvidence = {
+      runId: "run-1",
+      hypothesisId: "price-authority",
+      verdict: "CONFIRMED",
+      executed: true,
+    };
+    assert.equal(
+      executionResultSchema.safeParse(pollutedEvidence).success,
+      false,
+      "Object.prototype.evidence must not satisfy an own evidence requirement",
+    );
+  } finally {
+    if (previousEvidence === undefined) {
+      delete (Object.prototype as Record<string, unknown>).evidence;
+    } else {
+      Object.defineProperty(Object.prototype, "evidence", previousEvidence);
+    }
+  }
+
+  const evidenceAtLimit = Object.assign(Object.create(null) as Record<string, unknown>, {
+    runId: "run-1",
+    hypothesisId: "price-authority",
+    verdict: "CONFIRMED",
+    executed: true,
+    evidence: Array.from({ length: 64 }, () => ({ ...validEvidence })),
+  });
+  assert.equal(
+    executionResultSchema.safeParse(evidenceAtLimit).success,
+    true,
+    "64 execution evidence items must be accepted",
+  );
+
+  const evidenceOverLimit = {
+    ...evidenceAtLimit,
+    evidence: Array.from({ length: 65 }, () => ({ ...validEvidence })),
+  };
+  assert.equal(
+    executionResultSchema.safeParse(evidenceOverLimit).success,
+    false,
+    "65 execution evidence items must be rejected",
   );
 });

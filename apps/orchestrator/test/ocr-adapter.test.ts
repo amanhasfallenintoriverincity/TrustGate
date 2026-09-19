@@ -86,6 +86,66 @@ test("runOcrProcess ignores an executable in the target repository", async (t) =
   assert.match(output, /^open-code-review v1\.12\.6\b/);
 });
 
+test("runOcrProcess forces OCR_NO_UPDATE=1 for the launcher", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-ocr-env-"));
+  const captureVariable = "TRUSTGATE_OCR_ENV_CAPTURE";
+  const originalEnvironment = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    NODE_OPTIONS: process.env.NODE_OPTIONS,
+    OCR_NO_UPDATE: process.env.OCR_NO_UPDATE,
+    [captureVariable]: process.env[captureVariable],
+  };
+  t.after(async () => {
+    for (const [name, value] of Object.entries(originalEnvironment)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  const preload = join(repo, "capture-ocr-env.cjs");
+  await writeFile(
+    preload,
+    `const childProcess = require("node:child_process");
+const { appendFileSync } = require("node:fs");
+appendFileSync(
+  process.env.${captureVariable},
+  JSON.stringify(process.env.OCR_NO_UPDATE ?? null) + "\\n",
+);
+const spawn = childProcess.spawn;
+childProcess.spawn = function (command, args, options) {
+  const isUpdater =
+    command === process.execPath &&
+    Array.isArray(args) &&
+    typeof args[0] === "string" &&
+    /[\\\\/]scripts[\\\\/]update\\.js$/.test(args[0]);
+  if (isUpdater) return { unref() {} };
+  return spawn.call(this, command, args, options);
+};
+`,
+  );
+
+  process.env.HOME = repo;
+  process.env.USERPROFILE = repo;
+  process.env.NODE_OPTIONS = `--require=${preload}`;
+
+  const observed: Array<string | null> = [];
+  for (const [index, inheritedValue] of [undefined, "", "0"].entries()) {
+    if (inheritedValue === undefined) delete process.env.OCR_NO_UPDATE;
+    else process.env.OCR_NO_UPDATE = inheritedValue;
+
+    const capture = join(repo, `ocr-env-${index}.jsonl`);
+    process.env[captureVariable] = capture;
+    await runOcrProcess(["--version"], repo);
+    const lines = (await readFile(capture, "utf8")).trimEnd().split("\n");
+    assert.equal(lines.length, 1, "the controlled launcher ran more than once");
+    observed.push(JSON.parse(lines[0]!) as string | null);
+  }
+
+  assert.deepEqual(observed, ["1", "1", "1"]);
+});
+
 test("preview and rule calls are converted into review input", async () => {
   const { runOcr, calls } = createFixtureRunner(previewFixture);
 

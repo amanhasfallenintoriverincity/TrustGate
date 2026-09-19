@@ -176,6 +176,7 @@ const parseRuleGroups = (
 export const runOcrProcess: RunOcr = async (args, repo) => {
   const result = await execa(process.execPath, [ocrLauncher, ...args], {
     cwd: repo,
+    env: { ...process.env, OCR_NO_UPDATE: "1" },
     timeout: 30_000,
     reject: true,
     preferLocal: false,

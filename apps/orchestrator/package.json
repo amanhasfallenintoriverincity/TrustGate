@@ -13,6 +13,10 @@
     "./ocr-adapter": {
       "types": "./dist/ocr-adapter.d.ts",
       "default": "./dist/ocr-adapter.js"
+    },
+    "./diff-collector": {
+      "types": "./dist/diff-collector.d.ts",
+      "default": "./dist/diff-collector.js"
     }
   },
   "engines": {

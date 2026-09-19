@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
   analysisPlanSchema,
   executionResultSchema,
   JSON_MAX_DEPTH,
+  jsonValueSchema,
 } from "../src/index.js";
 
 const validPlan = {
@@ -137,6 +139,68 @@ test("analysis plan rejects arbitrary commands and external URLs", () => {
     "request paths over 512 characters must be rejected",
   );
 
+  const pathDescriptorProbe = spawnSync(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    [
+      'import { analysisPlanSchema } from "./packages/contracts/src/index.ts";',
+      `const plan = ${JSON.stringify(validPlan)};`,
+      "for (const descriptor of [",
+      '  { configurable: true, value: "https://evil.test", writable: false },',
+      '  { configurable: true, get: () => "https://evil.test" },',
+      "]) {",
+      '  Object.defineProperty(Object.prototype, "path", descriptor);',
+      "  let result;",
+      "  try { result = analysisPlanSchema.safeParse(plan); } catch { process.exit(1); }",
+      "  if (result.success) process.exit(1);",
+      '  delete Object.prototype.path;',
+      "}",
+    ].join("\n"),
+  ], {
+    cwd: new URL("../../..", import.meta.url),
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(
+    pathDescriptorProbe.status,
+    0,
+    `strong Object.prototype.path descriptors must fail closed without throwing (signal=${pathDescriptorProbe.signal}, stderr=${pathDescriptorProbe.stderr})`,
+  );
+
+  const jsonEqualsPathAtLimit = `$.${"a".repeat(510)}`;
+  assert.equal(jsonEqualsPathAtLimit.length, 512);
+  assert.equal(
+    analysisPlanSchema.safeParse(planWithTest({
+      ...validTest,
+      assertions: [{ kind: "json-equals", path: jsonEqualsPathAtLimit, equals: true }],
+    })).success,
+    true,
+    "512-character json-equals paths must be accepted",
+  );
+  const overlongJsonEqualsPath = `$.${"a".repeat(511)}`;
+  assert.equal(overlongJsonEqualsPath.length, 513);
+  assert.equal(
+    analysisPlanSchema.safeParse(planWithTest({
+      ...validTest,
+      assertions: [{ kind: "json-equals", path: overlongJsonEqualsPath, equals: true }],
+    })).success,
+    false,
+    "json-equals paths over 512 characters must be rejected",
+  );
+
+  assert.equal(
+    jsonValueSchema.safeParse({ ["k".repeat(256)]: true }).success,
+    true,
+    "256-character JSON record keys must be accepted",
+  );
+  assert.equal(
+    jsonValueSchema.safeParse({ ["k".repeat(257)]: true }).success,
+    false,
+    "JSON record keys over 256 characters must be rejected",
+  );
+
   const previousMethod = Object.getOwnPropertyDescriptor(Object.prototype, "method");
   try {
     Object.defineProperty(Object.prototype, "method", {
@@ -261,39 +325,63 @@ test("analysis plan rejects arbitrary commands and external URLs", () => {
     "JSON over the depth limit must be rejected",
   );
 
-  const arrayPollutionTargets = [
-    ["Object.prototype", Object.prototype],
-    ["Array.prototype", Array.prototype],
-  ] as const;
-  for (const [label, target] of arrayPollutionTargets) {
-    const previousIndex = Object.getOwnPropertyDescriptor(target, "0");
-    try {
-      Object.defineProperty(target, "0", {
-        configurable: true,
-        value: "inherited-array-value",
-        writable: true,
-      });
-      const sparseBody = new Array(1);
-      let sparseBodyResult: ReturnType<typeof analysisPlanSchema.safeParse> | undefined;
-      assert.doesNotThrow(() => {
-        sparseBodyResult = analysisPlanSchema.safeParse(planWithTest({
-          ...validTest,
-          request: { ...validTest.request, body: sparseBody },
-        }));
-      });
-      assert.equal(
-        sparseBodyResult?.success,
-        false,
-        `${label}[0] must not make a sparse JSON array valid`,
-      );
-    } finally {
-      if (previousIndex === undefined) {
-        delete (target as Record<string, unknown>)["0"];
-      } else {
-        Object.defineProperty(target, "0", previousIndex);
-      }
-    }
-  }
+  const jsonArrayDescriptorProbe = spawnSync(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    [
+      'import { jsonValueSchema } from "./packages/contracts/src/index.ts";',
+      "for (const target of [Object.prototype, Array.prototype]) {",
+      "  for (const descriptor of [",
+      '    { configurable: true, value: "inherited-array-value", writable: false },',
+      '    { configurable: true, get: () => "inherited-array-value" },',
+      "  ]) {",
+      '    Object.defineProperty(target, "0", descriptor);',
+      "    let denseResult;",
+      "    let sparseResult;",
+      "    try {",
+      "      denseResult = jsonValueSchema.safeParse([1]);",
+      "      sparseResult = jsonValueSchema.safeParse(new Array(1));",
+      "    } catch { process.exit(1); }",
+      "    if (!denseResult.success || !Array.isArray(denseResult.data) || sparseResult.success) process.exit(1);",
+      '    delete target["0"];',
+      "  }",
+      "}",
+    ].join("\n"),
+  ], {
+    cwd: new URL("../../..", import.meta.url),
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(
+    jsonArrayDescriptorProbe.status,
+    0,
+    `strong numeric descriptors must accept dense and reject sparse JSON arrays without throwing (signal=${jsonArrayDescriptorProbe.signal}, stderr=${jsonArrayDescriptorProbe.stderr})`,
+  );
+
+  const hugeSparseProbe = spawnSync(process.execPath, [
+    "--max-old-space-size=64",
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    [
+      'import { jsonValueSchema } from "./packages/contracts/src/index.ts";',
+      "const started = performance.now();",
+      "const result = jsonValueSchema.safeParse(new Array(1_000_000));",
+      "if (result.success || performance.now() - started >= 1_000) process.exit(1);",
+    ].join("\n"),
+  ], {
+    cwd: new URL("../../..", import.meta.url),
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(
+    hugeSparseProbe.status,
+    0,
+    `huge sparse JSON arrays must fail fast in 64 MiB (signal=${hugeSparseProbe.signal}, stderr=${hugeSparseProbe.stderr})`,
+  );
 
   let deeplyNestedJson: unknown = "leaf";
   for (let depth = 0; depth < 2_000; depth += 1) {
@@ -376,6 +464,42 @@ test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
     }
   }
 
+  const executedDescriptorProbe = spawnSync(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    [
+      'import { executionResultSchema } from "./packages/contracts/src/index.ts";',
+      `const input = ${JSON.stringify({
+        runId: "run-1",
+        hypothesisId: "price-authority",
+        verdict: "CONFIRMED",
+        executed: true,
+        evidence: [validEvidence],
+      })};`,
+      "for (const descriptor of [",
+      "  { configurable: true, value: true, writable: false },",
+      "  { configurable: true, get: () => true },",
+      "]) {",
+      '  Object.defineProperty(Object.prototype, "executed", descriptor);',
+      "  let result;",
+      "  try { result = executionResultSchema.safeParse(input); } catch { process.exit(1); }",
+      '  if (result.success && (!Object.hasOwn(result.data, "executed") || result.data.executed !== true)) process.exit(1);',
+      '  delete Object.prototype.executed;',
+      "}",
+    ].join("\n"),
+  ], {
+    cwd: new URL("../../..", import.meta.url),
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(
+    executedDescriptorProbe.status,
+    0,
+    `strong Object.prototype.executed descriptors must fail closed or preserve an own true value without throwing (signal=${executedDescriptorProbe.signal}, stderr=${executedDescriptorProbe.stderr})`,
+  );
+
   const previousEvidence = Object.getOwnPropertyDescriptor(Object.prototype, "evidence");
   try {
     Object.defineProperty(Object.prototype, "evidence", {
@@ -402,43 +526,42 @@ test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
     }
   }
 
-  const evidencePollutionTargets = [
-    ["Object.prototype", Object.prototype],
-    ["Array.prototype", Array.prototype],
-  ] as const;
-  for (const [label, target] of evidencePollutionTargets) {
-    const previousIndex = Object.getOwnPropertyDescriptor(target, "0");
-    try {
-      Object.defineProperty(target, "0", {
-        configurable: true,
-        value: validEvidence,
-        writable: true,
-      });
-      const sparseEvidence = new Array(1);
-      const sparseResult = {
-        runId: "run-1",
-        hypothesisId: "price-authority",
-        verdict: "CONFIRMED",
-        executed: true,
-        evidence: sparseEvidence,
-      };
-      let sparseEvidenceResult: ReturnType<typeof executionResultSchema.safeParse> | undefined;
-      assert.doesNotThrow(() => {
-        sparseEvidenceResult = executionResultSchema.safeParse(sparseResult);
-      });
-      assert.equal(
-        sparseEvidenceResult?.success,
-        false,
-        `${label}[0] must not make sparse execution evidence valid`,
-      );
-    } finally {
-      if (previousIndex === undefined) {
-        delete (target as Record<string, unknown>)["0"];
-      } else {
-        Object.defineProperty(target, "0", previousIndex);
-      }
-    }
-  }
+  const evidenceArrayDescriptorProbe = spawnSync(process.execPath, [
+    "--import",
+    "tsx",
+    "--input-type=module",
+    "--eval",
+    [
+      'import { executionResultSchema } from "./packages/contracts/src/index.ts";',
+      `const evidence = ${JSON.stringify(validEvidence)};`,
+      "for (const target of [Object.prototype, Array.prototype]) {",
+      "  for (const descriptor of [",
+      "    { configurable: true, value: evidence, writable: false },",
+      "    { configurable: true, get: () => evidence },",
+      "  ]) {",
+      '    Object.defineProperty(target, "0", descriptor);',
+      '    const base = { runId: "run-1", hypothesisId: "price-authority", verdict: "CONFIRMED", executed: true };',
+      "    let denseResult;",
+      "    let sparseResult;",
+      "    try {",
+      "      denseResult = executionResultSchema.safeParse({ ...base, evidence: [evidence] });",
+      "      sparseResult = executionResultSchema.safeParse({ ...base, evidence: new Array(1) });",
+      "    } catch { process.exit(1); }",
+      "    if (!denseResult.success || !Array.isArray(denseResult.data.evidence) || sparseResult.success) process.exit(1);",
+      '    delete target["0"];',
+      "  }",
+      "}",
+    ].join("\n"),
+  ], {
+    cwd: new URL("../../..", import.meta.url),
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(
+    evidenceArrayDescriptorProbe.status,
+    0,
+    `strong numeric descriptors must accept dense and reject sparse execution evidence without throwing (signal=${evidenceArrayDescriptorProbe.signal}, stderr=${evidenceArrayDescriptorProbe.stderr})`,
+  );
 
   const evidenceAtLimit = Object.assign(Object.create(null) as Record<string, unknown>, {
     runId: "run-1",

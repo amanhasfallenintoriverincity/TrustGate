@@ -26,6 +26,110 @@ type SerializedPlannerInput = {
   diffs: FileDiff[];
 };
 
+type ChangedLine = { line: number; text: string };
+
+type HunkState = {
+  oldLine: number;
+  newLine: number;
+  oldRemaining: number;
+  newRemaining: number;
+};
+
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/;
+
+const collectChangedLines = (diff: string): ChangedLine[] => {
+  const changedLines: ChangedLine[] = [];
+  let hunk: HunkState | undefined;
+
+  for (const line of diff.split("\n")) {
+    const header = HUNK_HEADER.exec(line);
+    if (header !== null) {
+      hunk = {
+        oldLine: Number(header[1]),
+        newLine: Number(header[3]),
+        oldRemaining: Number(header[2] ?? "1"),
+        newRemaining: Number(header[4] ?? "1"),
+      };
+      continue;
+    }
+    if (hunk === undefined || line.startsWith("\\ No newline at end of file")) {
+      continue;
+    }
+    if (hunk.oldRemaining === 0 && hunk.newRemaining === 0) {
+      hunk = undefined;
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      if (hunk.newRemaining === 0) {
+        hunk = undefined;
+        continue;
+      }
+      changedLines.push({ line: hunk.newLine, text: line.slice(1) });
+      hunk.newLine += 1;
+      hunk.newRemaining -= 1;
+      continue;
+    }
+    if (line.startsWith("-")) {
+      if (hunk.oldRemaining === 0) {
+        hunk = undefined;
+        continue;
+      }
+      changedLines.push({ line: hunk.oldLine, text: line.slice(1) });
+      hunk.oldLine += 1;
+      hunk.oldRemaining -= 1;
+      continue;
+    }
+    if (line.startsWith(" ")) {
+      if (hunk.oldRemaining === 0 || hunk.newRemaining === 0) {
+        hunk = undefined;
+        continue;
+      }
+      hunk.oldLine += 1;
+      hunk.newLine += 1;
+      hunk.oldRemaining -= 1;
+      hunk.newRemaining -= 1;
+      continue;
+    }
+
+    hunk = undefined;
+  }
+
+  return changedLines;
+};
+
+const validateEvidence = (plan: AnalysisPlan, diffs: FileDiff[]): void => {
+  const changedLinesByPath = new Map(
+    diffs.map(({ path, diff }) => [path, collectChangedLines(diff)]),
+  );
+
+  for (const hypothesis of plan.hypotheses) {
+    for (const evidence of hypothesis.evidence) {
+      const changedLines = changedLinesByPath.get(evidence.file);
+      if (changedLines === undefined) {
+        throw new Error(`Ungrounded evidence: unknown file ${evidence.file}`);
+      }
+
+      const excerpt = evidence.excerpt.trim();
+      if (excerpt.length === 0) {
+        throw new Error("Ungrounded evidence: excerpt must be non-empty");
+      }
+
+      const candidates = changedLines.filter(({ line }) => line === evidence.line);
+      if (candidates.length === 0) {
+        throw new Error(
+          `Ungrounded evidence: ${evidence.file}:${evidence.line} is not a changed line`,
+        );
+      }
+      if (!candidates.some(({ text }) => text.includes(excerpt))) {
+        throw new Error(
+          `Ungrounded evidence: excerpt is not present at ${evidence.file}:${evidence.line}`,
+        );
+      }
+    }
+  }
+};
+
 const serializeInput = (input: PlannerInput): string => {
   if (input.files.length === 0 || input.diffs.length === 0) {
     throw new Error("review files and diffs must be non-empty");
@@ -137,6 +241,8 @@ export const createSecurityPlanner = (client: LlmClient) => ({
       temperature: 0,
       maxTokens: 3000,
     });
-    return parseContractJson(analysisPlanSchema, response.text);
+    const plan = parseContractJson(analysisPlanSchema, response.text);
+    validateEvidence(plan, input.diffs);
+    return plan;
   },
 });

@@ -1,0 +1,27 @@
+{
+  "providers": [
+    {
+      "id": "openai-compatible",
+      "kind": "openai-compatible",
+      "baseUrl": "https://provider.example/v1",
+      "model": "model-name",
+      "apiKeyEnv": "LLM_API_KEY",
+      "timeoutMs": 120000
+    },
+    {
+      "id": "anthropic-compatible",
+      "kind": "anthropic-compatible",
+      "baseUrl": "https://provider.example/v1",
+      "model": "model-name",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "anthropicVersion": "2023-06-01",
+      "timeoutMs": 120000
+    },
+    {
+      "id": "codex-oauth",
+      "kind": "openai-codex-oauth",
+      "model": "gpt-5.4-mini",
+      "timeoutMs": 120000
+    }
+  ]
+}

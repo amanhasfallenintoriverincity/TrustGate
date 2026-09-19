@@ -1,4 +1,11 @@
+import { createRequire } from "node:module";
+
 import { execa } from "execa";
+
+const require = createRequire(import.meta.url);
+const ocrLauncher = require.resolve(
+  "@alibaba-group/open-code-review/bin/ocr.js",
+);
 
 export type ReviewInput = {
   mode: "workspace" | "range" | "commit";
@@ -53,11 +60,10 @@ const requireNonEmptyString = (value: unknown, field: string): string => {
 const requireCount = (value: unknown, field: string): number => {
   if (
     typeof value !== "number" ||
-    !Number.isFinite(value) ||
-    !Number.isInteger(value) ||
+    !Number.isSafeInteger(value) ||
     value < 0
   ) {
-    throw new Error(`${field} must be a nonnegative integer`);
+    throw new Error(`${field} must be a nonnegative safe integer`);
   }
   return value;
 };
@@ -108,19 +114,28 @@ const parsePreview = (
   return { mode: preview.mode, files };
 };
 
-const parseRuleGroups = (output: string): ReviewInput["ruleGroups"] => {
+const parseRuleGroups = (
+  output: string,
+  selectedPaths: string[],
+): ReviewInput["ruleGroups"] => {
   const ruleOutput = parseJsonObject(output, "rule");
   requireSchemaVersion(ruleOutput, "rule");
   if (!Array.isArray(ruleOutput.groups)) {
     throw new Error("OCR rule: groups must be an array");
   }
+  if (selectedPaths.length > 0 && ruleOutput.groups.length === 0) {
+    throw new Error("OCR rule: groups must not be empty for selected paths");
+  }
 
-  return ruleOutput.groups.map((candidate, index) => {
+  const ruleGroups = ruleOutput.groups.map((candidate, index) => {
     if (!isObject(candidate)) {
       throw new Error(`OCR rule: groups[${index}] must be an object`);
     }
     if (!Array.isArray(candidate.files)) {
       throw new Error(`OCR rule: groups[${index}].files must be an array`);
+    }
+    if (candidate.files.length === 0) {
+      throw new Error(`OCR rule: groups[${index}].files must not be empty`);
     }
     const files = candidate.files.map((file, fileIndex) =>
       requireNonEmptyString(
@@ -133,14 +148,37 @@ const parseRuleGroups = (output: string): ReviewInput["ruleGroups"] => {
     }
     return { files, rules: candidate.rule };
   });
+
+  const selectedPathSet = new Set(selectedPaths);
+  const groupedPaths = new Set<string>();
+  for (const groupedPath of ruleGroups.flatMap((group) => group.files)) {
+    if (groupedPaths.has(groupedPath)) {
+      throw new Error(`OCR rule: duplicate group path: ${groupedPath}`);
+    }
+    groupedPaths.add(groupedPath);
+  }
+  for (const groupedPath of groupedPaths) {
+    if (!selectedPathSet.has(groupedPath)) {
+      throw new Error(`OCR rule: group path was not selected: ${groupedPath}`);
+    }
+  }
+  for (const selectedPath of selectedPaths) {
+    if (!groupedPaths.has(selectedPath)) {
+      throw new Error(
+        `OCR rule: selected path missing from groups: ${selectedPath}`,
+      );
+    }
+  }
+
+  return ruleGroups;
 };
 
 export const runOcrProcess: RunOcr = async (args, repo) => {
-  const result = await execa("ocr", args, {
+  const result = await execa(process.execPath, [ocrLauncher, ...args], {
     cwd: repo,
     timeout: 30_000,
     reject: true,
-    preferLocal: true,
+    preferLocal: false,
     maxBuffer: 1024 * 1024,
   });
   return result.stdout;
@@ -171,6 +209,13 @@ export const createOcrAdapter = (runOcr: RunOcr = runOcrProcess) => ({
       repo,
     );
 
-    return { mode, files, ruleGroups: parseRuleGroups(ruleOutput) };
+    return {
+      mode,
+      files,
+      ruleGroups: parseRuleGroups(
+        ruleOutput,
+        files.map((file) => file.path),
+      ),
+    };
   },
 });

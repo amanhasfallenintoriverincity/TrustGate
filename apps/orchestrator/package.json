@@ -6,6 +6,10 @@
   "main": "dist/ocr-adapter.js",
   "types": "dist/ocr-adapter.d.ts",
   "exports": {
+    ".": {
+      "types": "./dist/ocr-adapter.d.ts",
+      "default": "./dist/ocr-adapter.js"
+    },
     "./ocr-adapter": {
       "types": "./dist/ocr-adapter.d.ts",
       "default": "./dist/ocr-adapter.js"

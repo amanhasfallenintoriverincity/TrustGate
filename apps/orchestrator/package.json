@@ -17,6 +17,10 @@
     "./diff-collector": {
       "types": "./dist/diff-collector.d.ts",
       "default": "./dist/diff-collector.js"
+    },
+    "./planner": {
+      "types": "./dist/planner.d.ts",
+      "default": "./dist/planner.js"
     }
   },
   "engines": {
@@ -28,6 +32,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@trustgate/contracts": "0.1.0",
+    "@trustgate/llm-gateway": "0.1.0",
     "execa": "10.0.1"
   },
   "devDependencies": {

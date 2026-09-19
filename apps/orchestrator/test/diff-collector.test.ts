@@ -301,6 +301,60 @@ test("collector does not mutate its input array or file objects", async () => {
   ]);
 });
 
+test("runGitDiffProcess treats a wildcard path as a literal filename", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-wildcard-diff-"));
+  t.after(async () => {
+    await rm(repo, { recursive: true, force: true });
+  });
+  await initializeRepository(repo);
+
+  await writeFile(join(repo, "safe.txt"), "safe before\n");
+  await writeFile(join(repo, ".env"), "secret before\n");
+  await execa("git", ["add", "--", "safe.txt", ".env"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "safe.txt"), "safe after\n");
+  await writeFile(join(repo, ".env"), "secret after\n");
+
+  const output = await runGitDiffProcess(repo, "*.txt");
+
+  assert.doesNotMatch(output, /safe\.txt/);
+  assert.doesNotMatch(output, /\.env/);
+  assert.equal(output, "");
+});
+
+test("runGitDiffProcess treats exclude magic as a literal filename", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-exclude-diff-"));
+  t.after(async () => {
+    await rm(repo, { recursive: true, force: true });
+  });
+  await initializeRepository(repo);
+
+  await writeFile(join(repo, "safe.txt"), "safe before\n");
+  await writeFile(join(repo, ".env"), "secret before\n");
+  await execa("git", ["add", "--", "safe.txt", ".env"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await execa("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: repo,
+    preferLocal: false,
+  });
+  await writeFile(join(repo, "safe.txt"), "safe after\n");
+  await writeFile(join(repo, ".env"), "secret after\n");
+
+  const output = await runGitDiffProcess(repo, ":(exclude)safe.txt");
+
+  assert.doesNotMatch(output, /\.env/);
+  assert.doesNotMatch(output, /safe\.txt/);
+  assert.equal(output, "");
+});
+
 test("runGitDiffProcess passes an option-like path after Git's option terminator", async (t) => {
   const repo = await mkdtemp(join(tmpdir(), "trustgate-option-diff-"));
   t.after(async () => {

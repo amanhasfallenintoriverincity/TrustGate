@@ -85,13 +85,18 @@ const truncateUtf8 = (
 };
 
 export const runGitDiffProcess: RunGitDiff = async (repo, filePath) => {
-  const result = await execa("git", ["diff", "HEAD", "--", filePath], {
-    cwd: repo,
-    timeout: 30_000,
-    reject: true,
-    preferLocal: false,
-    maxBuffer: 1024 * 1024,
-  });
+  // Literal pathspecs keep Git's matcher inside the selected-file security boundary.
+  const result = await execa(
+    "git",
+    ["--literal-pathspecs", "diff", "HEAD", "--", filePath],
+    {
+      cwd: repo,
+      timeout: 30_000,
+      reject: true,
+      preferLocal: false,
+      maxBuffer: 1024 * 1024,
+    },
+  );
   return result.stdout;
 };
 

@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import {
   analysisPlanSchema,
   executionResultSchema,
+  JSON_MAX_DEPTH,
   type AnalysisPlan,
   type ExecutionResult,
 } from "@trustgate/contracts";
@@ -68,11 +69,39 @@ type ExpectedIdentity = {
 };
 
 const PUBLIC_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-const RELATIVE_REPO_PATH_PATTERN = /^(?!\/)(?!.*(?:^|\/)\.\.?\/)(?!.*\/\/)[A-Za-z0-9._@+ -]+(?:\/[A-Za-z0-9._@+ -]+)*$/;
+const RELATIVE_REPO_PATH_PATTERN = /^(?!\/)(?!.*\/\/)[A-Za-z0-9._@+ -]+(?:\/[A-Za-z0-9._@+ -]+)*$/;
 const SECRET_METADATA_PATTERN =
   /(?:authorization\s*:|bearer\s+|x-api-key|api[_-]?key|github[_-]?token|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|credential|\.codex(?:\/|\\)auth\.json|(?:^|[\/\\])\.env(?:[.\/\\]|$)|\bsecret\b)/i;
 const SECRET_FILE_BASENAME_PATTERN = /^(?:\.env(?:\..*)?|auth\.json)$/i;
 const SECRET_FILE_EXTENSION_PATTERN = /\.(?:pem|key)$/i;
+const SENSITIVE_KEY_NAMES = new Set([
+  "prompt",
+  "systemprompt",
+  "userprompt",
+  "apikey",
+  "token",
+  "accesstoken",
+  "refreshtoken",
+  "oauthpath",
+  "authpath",
+  "repopath",
+  "env",
+  "environment",
+  "rawerror",
+  "errordetail",
+  "credential",
+  "password",
+  "secret",
+  "githubtoken",
+  "clientsecret",
+  "privatekey",
+]);
+const SENSITIVE_STRING_PATTERN =
+  /(?:raw[-_ ]?(?:prompt|error)(?:[-_ ]?marker)?|authorization\s*:\s*\S+|bearer\s+(?!(?:authentication|authorization|scheme|header)(?:\s|$))\S+|x-api-key\s*[:=]|api[_ -]?key(?:\s*[:=]|[-_ ]?marker\b)|(?:github|access|refresh)[_-]?token\s*[:=]|\btoken\s*[:=]|\btoken[-_ ]?marker\b|\bcredential\s*[:=]|\bcredential[-_ ]?marker\b|\bpassword\s*[:=]|\bpassword[-_ ]?marker\b|\bsecret\s*[:=]|\bsecret[-_ ]?marker\b|\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}|\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\.codex(?:\/|\\)auth\.json|(?:^|[\/\\])\.env(?:[.\/\\]|$)|(?:^|[\/\\])[^\/\\]+\.(?:pem|key)$|^\/home\/|^\/Users\/|^[A-Za-z]:[\\/]|^\\\\)/i;
+// Contract schemas cap JSON at depth 8, while report wrappers add at most eight levels.
+const MAX_SENSITIVE_SCAN_DEPTH = JSON_MAX_DEPTH + 8;
+// Every JSON node consumes at least one byte inside the existing report byte cap.
+const MAX_SENSITIVE_SCAN_NODES = REPORT_MAX_BYTES;
 const DURATION_KEYS = [
   "totalMs",
   "ocrMs",
@@ -126,12 +155,65 @@ const validReviewedFile = (value: unknown): value is string => {
   ) {
     return false;
   }
-  const baseName = value.split("/").at(-1)!;
+  const segments = value.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    return false;
+  }
+  const baseName = segments.at(-1)!;
   return (
     !SECRET_FILE_BASENAME_PATTERN.test(baseName) &&
     !SECRET_FILE_EXTENSION_PATTERN.test(baseName) &&
     !/(?:^|[-_.])token(?:[-_.]|$)/i.test(baseName)
   );
+};
+
+const normalizedSensitiveKey = (key: string): string =>
+  key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+
+const containsSensitiveDurableValue = (root: unknown): boolean => {
+  const pending: Array<{ value: unknown; depth: number }> = [
+    { value: root, depth: 0 },
+  ];
+  let visited = 0;
+
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (entry === undefined) return true;
+    visited += 1;
+    if (
+      visited > MAX_SENSITIVE_SCAN_NODES ||
+      entry.depth > MAX_SENSITIVE_SCAN_DEPTH
+    ) {
+      return true;
+    }
+
+    if (typeof entry.value === "string") {
+      if (SENSITIVE_STRING_PATTERN.test(entry.value)) return true;
+      continue;
+    }
+    if (
+      entry.value === null ||
+      typeof entry.value === "number" ||
+      typeof entry.value === "boolean"
+    ) {
+      continue;
+    }
+    if (Array.isArray(entry.value)) {
+      if (entry.depth === MAX_SENSITIVE_SCAN_DEPTH) return true;
+      for (const value of entry.value) {
+        pending.push({ value, depth: entry.depth + 1 });
+      }
+      continue;
+    }
+    if (!isPlainRecord(entry.value)) return true;
+    if (entry.depth === MAX_SENSITIVE_SCAN_DEPTH) return true;
+    for (const [key, value] of Object.entries(entry.value)) {
+      if (SENSITIVE_KEY_NAMES.has(normalizedSensitiveKey(key))) return true;
+      pending.push({ value, depth: entry.depth + 1 });
+    }
+  }
+
+  return false;
 };
 
 const parseInputSnapshot = (input: ReportInput): ReportInput => {
@@ -199,6 +281,14 @@ const parseInputSnapshot = (input: ReportInput): ReportInput => {
       .array()
       .max(50)
       .parse(snapshot.patchedResults);
+
+    if (
+      containsSensitiveDurableValue(hypotheses) ||
+      containsSensitiveDurableValue(vulnerableResults) ||
+      containsSensitiveDurableValue(patchedResults)
+    ) {
+      return rejectReport();
+    }
 
     if (
       snapshot.durations === null ||

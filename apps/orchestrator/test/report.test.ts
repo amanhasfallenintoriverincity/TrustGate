@@ -249,6 +249,171 @@ test("report rejects invalid reviewed file lists and public metadata", () => {
   }
 });
 
+for (const path of [".", "..", "src/.", "src/..", "src/./file.ts", "src/../file.ts"]) {
+  test(`report rejects reviewed file dot segment: ${path}`, () => {
+    const input = makeInput();
+    input.reviewedFiles = [path];
+
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+}
+
+test("report rejects a raw prompt marker in hypothesis evidence", () => {
+  const input = makeInput();
+  input.hypotheses[0]!.evidence[0]!.excerpt = "raw-prompt-marker";
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+});
+
+const sensitiveBodyKeys = [
+  "prompt",
+  "systemPrompt",
+  "user_prompt",
+  "api-key",
+  "token",
+  "accessToken",
+  "refresh_token",
+  "oauthPath",
+  "auth_path",
+  "repoPath",
+  "env",
+  "environment",
+  "rawError",
+  "error_detail",
+  "credential",
+  "password",
+  "secret",
+  "githubToken",
+  "client-secret",
+  "privateKey",
+] as const;
+
+for (const key of sensitiveBodyKeys) {
+  test(`report rejects sensitive nested request body key: ${key}`, () => {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = {
+      [key]: "public-example",
+    };
+
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+}
+
+const sensitiveBodyValues = [
+  ["API key marker", "api-key-marker"],
+  ["OpenAI-style API key", "sk-proj-A1b2C3d4E5f6G7h8"],
+  ["short Bearer credential", "Bearer abc used by caller"],
+  ["JWT credential", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123"],
+  ["OAuth credential path", "config/.codex/auth.json"],
+  ["absolute Linux repository path", "/home/user/private/repo"],
+  ["token environment marker", "GITHUB_TOKEN=token-marker"],
+  ["dotenv path", "config/.env.production"],
+  ["PEM path", "cert/private.pem"],
+  ["private key path", "cert/private.key"],
+  ["macOS home path", "/Users/example/private/repo"],
+  ["Windows drive path", "C:\\Users\\example\\private\\repo"],
+  ["Windows UNC path", "\\\\server\\share\\private\\repo"],
+] as const;
+
+for (const [name, value] of sensitiveBodyValues) {
+  test(`report rejects sensitive nested request body value: ${name}`, () => {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = { note: value };
+
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+}
+
+for (const side of ["vulnerable", "patched"] as const) {
+  for (const field of ["expected", "actual"] as const) {
+    for (const value of [
+      "raw-error-marker",
+      "credential=credential-marker",
+    ] as const) {
+      test(`report rejects ${side} execution evidence ${field}: ${value}`, () => {
+        const input = makeInput();
+        const results =
+          side === "vulnerable" ? input.vulnerableResults : input.patchedResults;
+        if (side === "patched") {
+          results[0] = result("negative-price", "ERROR");
+        }
+        results[0]!.evidence[0]![field] = value;
+
+        assert.equal(rejectionMessage(input), "run report rejected");
+      });
+    }
+  }
+}
+
+test("report preserves safe security language and valid API paths", () => {
+  const input = makeInput();
+  const hypothesis = input.hypotheses[0]!;
+  const spec = hypothesis.tests[0]!;
+  hypothesis.title = "Missing authorization check";
+  hypothesis.evidence[0]!.excerpt =
+    "API key rotation and Bearer authentication use passwordless credentialing";
+  spec.request.path = "/api/token/refresh";
+  spec.request.body = {
+    tokenCount: 2,
+    tokenizer: "public tokenizer",
+    passwordless: true,
+    credentialing: "training",
+    secretariat: "office",
+  };
+  input.vulnerableResults[0] = result("negative-price", "ERROR");
+  input.patchedResults[0] = result("negative-price", "ERROR");
+
+  const report = createRunReport(input);
+
+  assert.equal(report.hypotheses[0]?.title, "Missing authorization check");
+  assert.equal(report.hypotheses[0]?.category, "price-tampering");
+  assert.equal(report.hypotheses[0]?.tests[0]?.request.path, "/api/token/refresh");
+  assert.equal(report.hypotheses[0]?.tests[0]?.assertions[0]?.kind, "status");
+  assert.equal(
+    report.vulnerableResults[0]?.evidence[0]?.kind,
+    "execution-error",
+  );
+  assert.equal(report.regressionVerdict, "UNVERIFIED");
+});
+
+test("report rejects secrets in deeply nested JSON values", () => {
+  const input = makeInput();
+  input.hypotheses[0]!.tests[0]!.request.body = {
+    payload: [{ metadata: { note: "raw-prompt-marker" } }],
+  };
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+});
+
+test("report preserves safe JSON at the contract depth bound", () => {
+  const input = makeInput();
+  let value: unknown = "public-example";
+  for (let depth = 0; depth < 8; depth += 1) {
+    value = { payload: value };
+  }
+  input.hypotheses[0]!.tests[0]!.request.body = value as NonNullable<
+    AnalysisPlan["hypotheses"][number]["tests"][number]["request"]["body"]
+  >;
+
+  assert.deepEqual(
+    createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
+    value,
+  );
+});
+
+test("report preserves a schema-valid wide JSON body below the byte cap", () => {
+  const input = makeInput();
+  const value = Array.from({ length: 64 }, () =>
+    Array.from({ length: 64 }, () => Array.from({ length: 3 }, () => false)),
+  );
+  input.hypotheses[0]!.tests[0]!.request.body = value;
+
+  assert.deepEqual(
+    createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
+    value,
+  );
+});
+
 test("report validates schema bounds result states cardinality and durations", () => {
   const malformedPlan = makeInput();
   malformedPlan.hypotheses[0]!.title = "x";

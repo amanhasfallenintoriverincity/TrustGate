@@ -1,0 +1,9 @@
+{
+  "name": "@trustgate/sandbox-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "fastify": "5.12.5",
+    "zod": "4.6.5"
+  }
+}

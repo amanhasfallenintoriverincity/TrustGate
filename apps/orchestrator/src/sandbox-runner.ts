@@ -61,6 +61,7 @@ export type SandboxCommandOptions = {
   preferLocal: false;
   shell: false;
   encoding: "utf8";
+  stripFinalNewline: false;
   maxBuffer: { stdout: 1_048_576; stderr: 8_192 };
 };
 
@@ -182,6 +183,7 @@ export const runPodmanSandboxProcess = async (
       preferLocal: false,
       shell: false,
       encoding: "utf8",
+      stripFinalNewline: false,
       maxBuffer: { stdout: STDOUT_MAX_BYTES, stderr: STDERR_MAX_BYTES },
     });
   } catch {

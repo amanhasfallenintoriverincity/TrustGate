@@ -325,7 +325,7 @@ test("malformed, oversized, and schema-invalid stdout fail closed", async () => 
 
 test("any stderr content, including whitespace, is rejected without disclosure", async () => {
   await withRuntime(async (hostRuntime) => {
-    for (const stderr of ["sensitive stderr marker", " \n\t"]) {
+    for (const stderr of ["sensitive stderr marker", " \n\t", "\n", "\r\n"]) {
       const runner = createSandboxRunner({
         image,
         hostRuntime,
@@ -429,8 +429,34 @@ test("Podman executor uses an absolute binary and exact bounded execa options", 
     preferLocal: false,
     shell: false,
     encoding: "utf8",
+    stripFinalNewline: false,
     maxBuffer: { stdout: 1_048_576, stderr: 8_192 },
   });
+});
+
+test("real execa preserves trailing LF and CRLF stderr", async () => {
+  const policy = {
+    args: [
+      "-e",
+      "const ending = process.argv[1]; process.stderr.write(ending === 'lf' ? '\\n' : '\\r\\n')",
+      "lf",
+    ],
+    env: { PATH: "/usr/bin:/bin" },
+    containersConf: SANDBOX_CONTAINERS_CONF,
+  } as const;
+
+  assert.deepEqual(
+    await runPodmanSandboxProcess(policy, "", process.execPath),
+    { stdout: "", stderr: "\n" },
+  );
+  assert.deepEqual(
+    await runPodmanSandboxProcess(
+      { ...policy, args: [...policy.args.slice(0, -1), "crlf"] },
+      "",
+      process.execPath,
+    ),
+    { stdout: "", stderr: "\r\n" },
+  );
 });
 
 test("Podman executor rejects untrusted paths and masks subprocess failures", async () => {

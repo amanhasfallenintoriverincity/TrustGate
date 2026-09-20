@@ -17,6 +17,8 @@
 !apps/demo-target/tsconfig.json
 !apps/demo-target/tsconfig.build.json
 !apps/demo-target/Containerfile.sandbox
+!apps/demo-target/runtime-package.json
+!apps/demo-target/runtime-package-lock.json
 !apps/demo-target/src
 !apps/demo-target/src/*.ts
 !packages

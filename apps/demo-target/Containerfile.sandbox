@@ -9,6 +9,8 @@ COPY apps/orchestrator/package.json apps/orchestrator/tsconfig.json apps/orchest
 COPY apps/orchestrator/src/spec-runner.ts apps/orchestrator/src/spec-runner.ts
 COPY apps/demo-target/package.json apps/demo-target/tsconfig.json apps/demo-target/tsconfig.build.json apps/demo-target/
 COPY apps/demo-target/src apps/demo-target/src
+COPY apps/demo-target/runtime-package.json ./runtime-manifest/package.json
+COPY apps/demo-target/runtime-package-lock.json ./runtime-manifest/package-lock.json
 
 RUN npm ci --ignore-scripts --no-audit --no-fund \
  && npm run build -w @trustgate/contracts \
@@ -30,7 +32,6 @@ RUN npm ci --ignore-scripts --no-audit --no-fund \
  && mkdir -p /runtime/apps/demo-target/dist \
              /runtime/apps/orchestrator/dist \
              /runtime/packages/contracts/dist \
-             /runtime/node_modules \
  && cp apps/demo-target/dist/sandbox-main.js \
        apps/demo-target/dist/server.js \
        apps/demo-target/dist/store.js \
@@ -39,16 +40,13 @@ RUN npm ci --ignore-scripts --no-audit --no-fund \
        /runtime/apps/orchestrator/dist/spec-runner.js \
  && cp packages/contracts/dist/index.js \
        /runtime/packages/contracts/dist/index.js \
- && printf '%s\n' '{"private":true}' > /runtime/package.json \
- && npm install \
-      --prefix /runtime \
+ && npm ci \
+      --prefix /build/runtime-manifest \
       --ignore-scripts \
       --no-audit \
       --no-fund \
       --omit=dev \
-      --package-lock=false \
-      --no-save \
-      fastify@5.12.5 zod@4.6.5 \
+ && mv /build/runtime-manifest/node_modules /runtime/node_modules \
  && rm -rf /runtime/node_modules/@trustgate/contracts \
              /runtime/node_modules/@trustgate/orchestrator \
  && mkdir -p /runtime/node_modules/@trustgate/contracts/dist \
@@ -64,14 +62,17 @@ RUN npm ci --ignore-scripts --no-audit --no-fund \
  && cp /runtime/apps/orchestrator/dist/spec-runner.js \
        /runtime/node_modules/@trustgate/orchestrator/dist/spec-runner.js \
  && find /runtime/node_modules -depth -type d \
-      \( -name .bin -o -name .cache -o -name .github \
-         -o -name benchmark -o -name benchmarks -o -name docs \
-         -o -name examples -o -name integration -o -name scripts \
-         -o -name test -o -name tests -o -name spec \) \
+      \( -name .bin -o -name .cache -o -name .claude -o -name .github \
+         -o -name .husky -o -name bench -o -name benchmark -o -name benchmarks \
+         -o -name docs -o -name example -o -name examples \
+         -o -name fixture -o -name fixtures -o -name integration \
+         -o -name scripts -o -name spec -o -name src \
+         -o -name test -o -name tests \) \
       -exec rm -rf {} + \
  && find /runtime/node_modules -type f \
-      \( -name '*.d.ts' -o -name '*.map' -o -name '*.md' \
-         -o -name '*.ts' -o -name '*.test.*' -o -name '*.spec.*' \
+      \( -name '*.d.ts' -o -name '*.d.cts' -o -name '*.d.mts' \
+         -o -name '*.map' -o -name '*.md' -o -name '*.ts' \
+         -o -name '*.test.*' -o -name '*.spec.*' -o -name 'bench.js' \
          -o -name 'benchmark.js' -o -name 'example.js' -o -name 'example.mjs' \
          -o -name 'test.js' -o -name 'eslint.config.js' -o -name 'tsconfig.json' \
          -o -name 'tap-snapshots.test.js' \) \

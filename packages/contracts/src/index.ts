@@ -124,40 +124,20 @@ export const executionResultSchema = z.object({
   executed: z.boolean(),
   evidence: z.array(executionEvidenceSchema).max(64),
 }).strict().superRefine((value, ctx) => {
-  if (value.verdict === "CONFIRMED") {
-    if (!value.executed) {
-      ctx.addIssue({
-        code: "custom",
-        message: "CONFIRMED requires executed=true",
-        path: ["executed"],
-      });
-    }
+  const hasEvidence = value.evidence.length > 0;
+  const isValidState =
+    (value.verdict === "CONFIRMED" && value.executed && hasEvidence) ||
+    (value.verdict === "BLOCKED" && value.executed && !hasEvidence) ||
+    ((value.verdict === "UNVERIFIED" || value.verdict === "ERROR") &&
+      !value.executed &&
+      hasEvidence);
 
-    if (value.evidence.length === 0) {
-      ctx.addIssue({
-        code: "custom",
-        message: "CONFIRMED requires at least one evidence item",
-        path: ["evidence"],
-      });
-    }
-  }
-
-  if (value.verdict === "BLOCKED") {
-    if (!value.executed) {
-      ctx.addIssue({
-        code: "custom",
-        message: "BLOCKED requires executed=true",
-        path: ["executed"],
-      });
-    }
-
-    if (value.evidence.length !== 0) {
-      ctx.addIssue({
-        code: "custom",
-        message: "BLOCKED requires empty evidence",
-        path: ["evidence"],
-      });
-    }
+  if (!isValidState) {
+    ctx.addIssue({
+      code: "custom",
+      message: "invalid execution verdict state",
+      path: ["verdict"],
+    });
   }
 });
 

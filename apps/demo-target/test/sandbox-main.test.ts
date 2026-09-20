@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   CONTRACT_JSON_MAX_BYTES,
@@ -382,4 +384,100 @@ test("sandbox runtime image copies only the execution graph", () => {
   );
   assert.match(containerfile, /apps\/orchestrator\/dist\/spec-runner\.js/);
   assert.match(containerfile, /packages\/contracts\/dist\/index\.js/);
+});
+
+test("sandbox runtime cleanup covers forbidden declarations and development artifacts", () => {
+  const containerfile = readFileSync(
+    new URL("../Containerfile.sandbox", import.meta.url),
+    "utf8",
+  );
+
+  for (const forbiddenDirectory of [
+    ".claude",
+    ".husky",
+    "bench",
+    "benchmark",
+    "benchmarks",
+    "docs",
+    "example",
+    "examples",
+    "fixture",
+    "fixtures",
+    "integration",
+    "scripts",
+    "spec",
+    "src",
+    "test",
+    "tests",
+  ]) {
+    assert.equal(
+      containerfile.includes(`-name ${forbiddenDirectory}`),
+      true,
+      `cleanup must remove ${forbiddenDirectory} directories`,
+    );
+  }
+  assert.match(containerfile, /-name '\*\.d\.cts'/);
+  assert.match(containerfile, /-name '\*\.d\.mts'/);
+  assert.match(containerfile, /-name 'bench\.js'/);
+});
+
+test("sandbox runtime dependencies are installed only from a committed lock", () => {
+  const containerfile = readFileSync(
+    new URL("../Containerfile.sandbox", import.meta.url),
+    "utf8",
+  );
+  const demoDirectory = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+  const repositoryDirectory = resolve(demoDirectory, "../..");
+  const runtimeManifest = JSON.parse(
+    readFileSync(resolve(demoDirectory, "runtime-package.json"), "utf8"),
+  ) as { dependencies?: Record<string, string> };
+  type LockedPackage = {
+    version?: string;
+    resolved?: string;
+    integrity?: string;
+  };
+  const runtimeLock = JSON.parse(
+    readFileSync(resolve(demoDirectory, "runtime-package-lock.json"), "utf8"),
+  ) as { packages: Record<string, LockedPackage> };
+  const rootLock = JSON.parse(
+    readFileSync(resolve(repositoryDirectory, "package-lock.json"), "utf8"),
+  ) as { packages: Record<string, LockedPackage> };
+
+  assert.deepEqual(runtimeManifest.dependencies, {
+    fastify: "5.12.5",
+    zod: "4.6.5",
+  });
+  assert.doesNotMatch(containerfile, /npm install/);
+  assert.doesNotMatch(containerfile, /--package-lock=false|--no-save/);
+  assert.match(
+    containerfile,
+    /COPY apps\/demo-target\/runtime-package\.json \.\/runtime-manifest\/package\.json/,
+  );
+  assert.match(
+    containerfile,
+    /COPY apps\/demo-target\/runtime-package-lock\.json \.\/runtime-manifest\/package-lock\.json/,
+  );
+  assert.match(
+    containerfile,
+    /npm ci[\s\\\n\S]*--prefix \/build\/runtime-manifest[\s\\\n\S]*--omit=dev/,
+  );
+
+  for (const [packagePath, lockedPackage] of Object.entries(runtimeLock.packages)) {
+    if (packagePath === "") continue;
+    const rootPackage = rootLock.packages[packagePath];
+    assert.ok(rootPackage, `${packagePath} must exist in the root lock`);
+    assert.deepEqual(
+      {
+        version: lockedPackage.version,
+        resolved: lockedPackage.resolved,
+        integrity: lockedPackage.integrity,
+      },
+      {
+        version: rootPackage.version,
+        resolved: rootPackage.resolved,
+        integrity: rootPackage.integrity,
+      },
+      `${packagePath} must preserve the root lock version, URL, and integrity`,
+    );
+  }
 });

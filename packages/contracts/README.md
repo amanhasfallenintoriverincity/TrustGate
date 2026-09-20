@@ -20,4 +20,9 @@ Arbitrary live JavaScript objects—including sparse arrays, getters, class inst
 
 ## Verdict boundary
 
-An LLM may propose hypotheses and bounded test specifications, but it never decides that a hypothesis is `CONFIRMED`. The execution-result schema enforces the deterministic invariant that `CONFIRMED` requires both `executed === true` and non-empty execution evidence.
+An LLM may propose hypotheses and bounded test specifications, but it never decides a verdict. The execution-result schema accepts exactly these states and rejects every other combination:
+
+- `CONFIRMED`: `executed === true` with non-empty execution evidence.
+- `BLOCKED`: `executed === true` with empty evidence.
+- `ERROR`: `executed === false` with non-empty sanitized reason evidence.
+- `UNVERIFIED`: `executed === false` with non-empty reason evidence.

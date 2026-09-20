@@ -366,33 +366,61 @@ test("analysis plan rejects arbitrary commands and external URLs", () => {
   );
 });
 
-test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
-  const unexecuted = {
+test("execution result enforces the complete verdict state machine", () => {
+  const verdicts = ["CONFIRMED", "BLOCKED", "UNVERIFIED", "ERROR"] as const;
+  const expectedValidity = {
+    CONFIRMED: {
+      "executed-empty": false,
+      "executed-evidence": true,
+      "unexecuted-empty": false,
+      "unexecuted-evidence": false,
+    },
+    BLOCKED: {
+      "executed-empty": true,
+      "executed-evidence": false,
+      "unexecuted-empty": false,
+      "unexecuted-evidence": false,
+    },
+    UNVERIFIED: {
+      "executed-empty": false,
+      "executed-evidence": false,
+      "unexecuted-empty": false,
+      "unexecuted-evidence": true,
+    },
+    ERROR: {
+      "executed-empty": false,
+      "executed-evidence": false,
+      "unexecuted-empty": false,
+      "unexecuted-evidence": true,
+    },
+  } as const;
+
+  for (const verdict of verdicts) {
+    for (const executed of [false, true]) {
+      for (const hasEvidence of [false, true]) {
+        const combination = `${executed ? "executed" : "unexecuted"}-${hasEvidence ? "evidence" : "empty"}` as keyof (typeof expectedValidity)[typeof verdict];
+        const result = {
+          runId: "run-1",
+          hypothesisId: "price-authority",
+          verdict,
+          executed,
+          evidence: hasEvidence ? [{ ...validEvidence }] : [],
+        };
+        assert.equal(
+          executionResultSchema.safeParse(result).success,
+          expectedValidity[verdict][combination],
+          `${verdict} ${combination}`,
+        );
+      }
+    }
+  }
+});
+
+test("execution result accepts at most 64 evidence items in evidence-bearing states", () => {
+  const evidenceAtLimit = {
     runId: "run-1",
     hypothesisId: "price-authority",
     verdict: "CONFIRMED",
-    executed: false,
-    evidence: [validEvidence],
-  };
-  assert.equal(
-    executionResultSchema.safeParse(unexecuted).success,
-    false,
-    "CONFIRMED with executed=false must be rejected",
-  );
-
-  const emptyEvidence = {
-    ...unexecuted,
-    executed: true,
-    evidence: [],
-  };
-  assert.equal(
-    executionResultSchema.safeParse(emptyEvidence).success,
-    false,
-    "CONFIRMED with empty evidence must be rejected",
-  );
-
-  const evidenceAtLimit = {
-    ...unexecuted,
     executed: true,
     evidence: Array.from({ length: 64 }, () => ({ ...validEvidence })),
   };
@@ -409,40 +437,4 @@ test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
     false,
     "65 execution evidence items must be rejected",
   );
-});
-
-test("execution result requires an executed BLOCKED verdict with empty evidence", () => {
-  const blocked = {
-    runId: "run-1",
-    hypothesisId: "price-authority",
-    verdict: "BLOCKED",
-    executed: true,
-    evidence: [],
-  };
-  assert.equal(
-    executionResultSchema.safeParse(blocked).success,
-    true,
-    "BLOCKED with executed=true and empty evidence must be accepted",
-  );
-  assert.equal(
-    executionResultSchema.safeParse({ ...blocked, executed: false }).success,
-    false,
-    "BLOCKED with executed=false must be rejected",
-  );
-  assert.equal(
-    executionResultSchema.safeParse({ ...blocked, evidence: [validEvidence] }).success,
-    false,
-    "BLOCKED with evidence must be rejected",
-  );
-
-  for (const validFailClosed of [
-    { ...blocked, verdict: "UNVERIFIED", executed: false, evidence: [] },
-    { ...blocked, verdict: "ERROR", executed: false, evidence: [validEvidence] },
-  ]) {
-    assert.equal(
-      executionResultSchema.safeParse(validFailClosed).success,
-      true,
-      `${validFailClosed.verdict} semantics must remain valid`,
-    );
-  }
 });

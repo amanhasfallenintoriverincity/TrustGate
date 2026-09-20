@@ -1,7 +1,39 @@
-# Deny the repository build context by default. Task 9 copies no host files.
+# Deny the repository build context by default.
 **
 
-# Explicitly document sensitive and generated paths as excluded.
+# Task 10 sandbox image: exact build manifests, configs, and source only.
+!package.json
+!package-lock.json
+!tsconfig.base.json
+!apps
+!apps/orchestrator
+!apps/orchestrator/package.json
+!apps/orchestrator/tsconfig.json
+!apps/orchestrator/tsconfig.build.json
+!apps/orchestrator/src
+!apps/orchestrator/src/*.ts
+!apps/demo-target
+!apps/demo-target/package.json
+!apps/demo-target/tsconfig.json
+!apps/demo-target/tsconfig.build.json
+!apps/demo-target/Containerfile.sandbox
+!apps/demo-target/src
+!apps/demo-target/src/*.ts
+!packages
+!packages/contracts
+!packages/contracts/package.json
+!packages/contracts/tsconfig.json
+!packages/contracts/tsconfig.build.json
+!packages/contracts/src
+!packages/contracts/src/*.ts
+!llm-gateway
+!llm-gateway/package.json
+!llm-gateway/tsconfig.json
+!llm-gateway/tsconfig.build.json
+!llm-gateway/src
+!llm-gateway/src/*.ts
+
+# Final exclusions remain authoritative for generated and sensitive content.
 .git
 .git/**
 .hermes

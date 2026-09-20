@@ -15,9 +15,13 @@
     "node": ">=24"
   },
   "scripts": {
+    "build:deps": "npm run build -w @trustgate/contracts && npm run build -w @trustgate/llm-gateway && npm run build -w @trustgate/orchestrator",
+    "prebuild": "npm run build:deps",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
+    "pretest": "npm run build:deps",
     "test": "tsx --test test/*.test.ts",
+    "pretypecheck": "npm run build:deps",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
@@ -26,6 +30,8 @@
     "typescript": "^5.9.0"
   },
   "dependencies": {
+    "@trustgate/contracts": "0.1.0",
+    "@trustgate/orchestrator": "0.1.0",
     "fastify": "5.12.5"
   }
 }

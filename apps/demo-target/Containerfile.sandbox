@@ -1,0 +1,59 @@
+FROM docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS build
+
+WORKDIR /build
+
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/contracts/package.json packages/contracts/tsconfig.json packages/contracts/tsconfig.build.json packages/contracts/
+COPY packages/contracts/src packages/contracts/src
+COPY llm-gateway/package.json llm-gateway/tsconfig.json llm-gateway/tsconfig.build.json llm-gateway/
+COPY llm-gateway/src llm-gateway/src
+COPY apps/orchestrator/package.json apps/orchestrator/tsconfig.json apps/orchestrator/tsconfig.build.json apps/orchestrator/
+COPY apps/orchestrator/src apps/orchestrator/src
+COPY apps/demo-target/package.json apps/demo-target/tsconfig.json apps/demo-target/tsconfig.build.json apps/demo-target/
+COPY apps/demo-target/src apps/demo-target/src
+
+RUN npm ci --ignore-scripts --no-audit --no-fund \
+ && npm run build -w @trustgate/contracts \
+ && npm run build -w @trustgate/llm-gateway \
+ && npm run build -w @trustgate/orchestrator \
+ && npm exec -- tsc -p apps/demo-target/tsconfig.build.json \
+ && npm prune --omit=dev --ignore-scripts --no-audit --no-fund \
+ && rm -rf \
+      node_modules/.bin \
+      node_modules/@alibaba-group \
+      node_modules/@types \
+      node_modules/tsx \
+      node_modules/typescript \
+      apps/demo-target/dist/*.d.ts \
+      apps/orchestrator/dist/*.d.ts \
+      apps/orchestrator/dist/prompts \
+      llm-gateway/dist/*.d.ts \
+      packages/contracts/dist/*.d.ts \
+      apps/orchestrator/src \
+      apps/demo-target/src \
+      packages/contracts/src \
+      llm-gateway/src
+
+FROM docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS runtime
+
+LABEL org.opencontainers.image.title="TrustGate sandbox target" \
+      org.opencontainers.image.description="Task 10 bounded JSON plan executor" \
+      trustgate.task="10"
+
+RUN mkdir -p /app \
+ && chown 65532:65532 /app
+WORKDIR /app
+
+COPY --from=build --chown=65532:65532 /build/package.json /build/package-lock.json ./
+COPY --from=build --chown=65532:65532 /build/node_modules ./node_modules
+COPY --from=build --chown=65532:65532 /build/apps/demo-target/package.json apps/demo-target/package.json
+COPY --from=build --chown=65532:65532 /build/apps/demo-target/dist apps/demo-target/dist
+COPY --from=build --chown=65532:65532 /build/apps/orchestrator/package.json apps/orchestrator/package.json
+COPY --from=build --chown=65532:65532 /build/apps/orchestrator/dist apps/orchestrator/dist
+COPY --from=build --chown=65532:65532 /build/packages/contracts/package.json packages/contracts/package.json
+COPY --from=build --chown=65532:65532 /build/packages/contracts/dist packages/contracts/dist
+COPY --from=build --chown=65532:65532 /build/llm-gateway/package.json llm-gateway/package.json
+COPY --from=build --chown=65532:65532 /build/llm-gateway/dist llm-gateway/dist
+
+USER 65532:65532
+CMD ["node", "apps/demo-target/dist/sandbox-main.js"]

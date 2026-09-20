@@ -190,6 +190,7 @@ export const buildSandboxArgs = (
   return [
     "run",
     "--rm",
+    "--interactive",
     "--name",
     name,
     "--pull",

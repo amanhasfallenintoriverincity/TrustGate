@@ -21,6 +21,7 @@ const containersConfPath = "/run/user/1000/trustgate/containers.conf";
 const vulnerableArgs = [
   "run",
   "--rm",
+  "--interactive",
   "--name",
   "trustgate-target-vulnerable",
   "--pull",
@@ -75,6 +76,7 @@ const vulnerableArgs = [
 const patchedArgs = [
   "run",
   "--rm",
+  "--interactive",
   "--name",
   "trustgate-target-patched",
   "--pull",
@@ -272,6 +274,7 @@ test("policy options are not duplicated", () => {
   const args = buildSandboxArgs(image, "vulnerable");
   const singleOptions = [
     "--rm",
+    "--interactive",
     "--name",
     "--pull",
     "--http-proxy=false",

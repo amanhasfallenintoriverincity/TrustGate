@@ -29,6 +29,10 @@
     "./sandbox-policy": {
       "types": "./dist/sandbox-policy.d.ts",
       "default": "./dist/sandbox-policy.js"
+    },
+    "./sandbox-runner": {
+      "types": "./dist/sandbox-runner.d.ts",
+      "default": "./dist/sandbox-runner.js"
     }
   },
   "engines": {

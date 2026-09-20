@@ -24,6 +24,7 @@ export type ReportDurations = {
   patchedMs: number;
 };
 
+/** Internal JSON-origin data; non-JSON JavaScript values are rejected, not normalized. */
 export type ReportInput = {
   runId: string;
   provider: string;
@@ -70,38 +71,38 @@ type ExpectedIdentity = {
 
 const PUBLIC_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const RELATIVE_REPO_PATH_PATTERN = /^(?!\/)(?!.*\/\/)[A-Za-z0-9._@+ -]+(?:\/[A-Za-z0-9._@+ -]+)*$/;
-const SECRET_METADATA_PATTERN =
-  /(?:authorization\s*:|bearer\s+|x-api-key|api[_-]?key|github[_-]?token|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|credential|\.codex(?:\/|\\)auth\.json|(?:^|[\/\\])\.env(?:[.\/\\]|$)|\bsecret\b)/i;
-const SECRET_FILE_BASENAME_PATTERN = /^(?:\.env(?:\..*)?|auth\.json)$/i;
-const SECRET_FILE_EXTENSION_PATTERN = /\.(?:pem|key)$/i;
-const SENSITIVE_KEY_NAMES = new Set([
-  "prompt",
-  "systemprompt",
-  "userprompt",
-  "apikey",
-  "token",
-  "accesstoken",
-  "refreshtoken",
-  "oauthpath",
-  "authpath",
-  "repopath",
-  "env",
-  "environment",
-  "rawerror",
-  "errordetail",
-  "credential",
-  "password",
-  "secret",
-  "githubtoken",
-  "clientsecret",
-  "privatekey",
-]);
-const SENSITIVE_STRING_PATTERN =
-  /(?:raw[-_ ]?(?:prompt|error)(?:[-_ ]?marker)?|authorization\s*:\s*\S+|bearer\s+(?!(?:authentication|authorization|scheme|header)(?:\s|$))\S+|x-api-key\s*[:=]|api[_ -]?key(?:\s*[:=]|[-_ ]?marker\b)|(?:github|access|refresh)[_-]?token\s*[:=]|\btoken\s*[:=]|\btoken[-_ ]?marker\b|\bcredential\s*[:=]|\bcredential[-_ ]?marker\b|\bpassword\s*[:=]|\bpassword[-_ ]?marker\b|\bsecret\s*[:=]|\bsecret[-_ ]?marker\b|\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}|\bAKIA[A-Z0-9]{16}\b|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----|\.codex(?:\/|\\)auth\.json|(?:^|[\/\\])\.env(?:[.\/\\]|$)|(?:^|[\/\\])[^\/\\]+\.(?:pem|key)$|^\/home\/|^\/Users\/|^[A-Za-z]:[\\/]|^\\\\)/i;
+const SENSITIVE_PATH_BASENAME_PATTERN =
+  /^(?:auth\.json|\.env[A-Za-z0-9._-]*|id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key(?:\.[A-Za-z0-9_-]+)?|[^/\\\s"'`]+\.(?:pem|key|p12|pfx))$/i;
+const SECRET_FILE_BASENAME_PATTERN =
+  /^(?:(?:api[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|oauth[-_]?token|credentials?|password|passwd|secret|client[-_]?secret)(?:\.(?:json|txt|ya?ml|env|ini|conf|config|properties))?|token\.(?:json|txt|ya?ml|env|ini|conf|config|properties))$/i;
+const SENSITIVE_STRING_PATTERNS = [
+  /\braw[-_ ]?(?:(?:system|user|developer)[-_ ]?)?(?:prompt|error)(?:[-_ ]?(?:detail|message|stack))?(?:[-_ ]?marker)?\b/i,
+  /\bauthorization\s*[:=]\s*\S+/i,
+  /\bbearer\s+(?!(?:authentication|authorization|scheme|header)\b)\S+/i,
+  /\b(?:(?:[A-Za-z0-9]+[_-])*api[_-]?key|x[-_]?api[-_]?key)\s*[:=]\s*\S+/i,
+  /\b(?:(?:github|session|access|refresh|oauth)[_-]?token|token)\s*[:=]\s*\S+/i,
+  /\b(?:(?:db[_-]?)?password|passwd)\s*[:=]\s*\S+/i,
+  /\b(?:client[_-]?secret|secret)\s*[:=]\s*\S+/i,
+  /\bcredentials?\s*[:=]\s*\S+/i,
+  /\b(?:api[-_ ]?key|token|password|credential|secret)[-_ ]?marker\b/i,
+  /\b(?:authorization|bearer|api[-_ ]?key|session[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|oauth[-_ ]?token|password|passwd|client[-_ ]?secret|secret|credential|aws[_-]?secret[_-]?access[_-]?key)s?\s*[:=]\s*\S+/i,
+  /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/i,
+  /\b(?:gh[opsur]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{12,}\b/i,
+  /\b(?:glpat-|npm_|pypi-|hf_|xai-|sk_live_|rk_live_)[A-Za-z0-9_-]{12,}\b/i,
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,
+  /\bAIza[0-9A-Za-z_-]{30,}\b/,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
+  /(?:^|[^A-Za-z0-9_./~-])\/(?:home|Users|root|tmp|var|opt|etc)\/(?:[^\s"'`<>]*)/i,
+  /(?:^|[^A-Za-z0-9_.-])~\/(?:\.ssh|\.aws|\.config|\.codex)\/(?:[^\s"'`<>]*)/i,
+  /(?:^|[^A-Za-z0-9_.-])(?:HOME|USERPROFILE)\s*\/\s*(?:\.ssh|\.aws|\.config|\.codex)\/(?:[^\s"'`<>]*)/i,
+  /(?:^|[^A-Za-z0-9_.-])[A-Za-z]:[\\/][^\s"'`<>]*/,
+  /(?:^|[\s"'`([{=:>,;])\\\\[^\\\s]+\\[^\\\s]+/,
+] as const;
 // Contract schemas cap JSON at depth 8, while report wrappers add at most eight levels.
-const MAX_SENSITIVE_SCAN_DEPTH = JSON_MAX_DEPTH + 8;
+const MAX_REPORT_JSON_DEPTH = JSON_MAX_DEPTH + 8;
 // Every JSON node consumes at least one byte inside the existing report byte cap.
-const MAX_SENSITIVE_SCAN_NODES = REPORT_MAX_BYTES;
+const MAX_REPORT_JSON_NODES = REPORT_MAX_BYTES;
 const DURATION_KEYS = [
   "totalMs",
   "ocrMs",
@@ -114,18 +115,122 @@ const rejectReport = (): never => {
   throw new Error("run report rejected");
 };
 
-const cloneJson = <Value>(value: Value): Value => {
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) return rejectReport();
-  return JSON.parse(serialized) as Value;
+type JsonSnapshot =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonSnapshot[]
+  | { [key: string]: JsonSnapshot };
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  Object.getPrototypeOf(value) === Object.prototype;
+
+const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
+  const ancestors = new Set<object>();
+  let visited = 0;
+
+  const visit = (value: unknown, depth: number): JsonSnapshot => {
+    visited += 1;
+    if (visited > MAX_REPORT_JSON_NODES || depth > MAX_REPORT_JSON_DEPTH) {
+      return rejectReport();
+    }
+    if (value === null || typeof value === "string" || typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? value : rejectReport();
+    }
+    if (typeof value !== "object") return rejectReport();
+    if (ancestors.has(value)) return rejectReport();
+
+    const prototype = Object.getPrototypeOf(value);
+    if (Array.isArray(value)) {
+      if (prototype !== Array.prototype) return rejectReport();
+    } else if (prototype !== Object.prototype) {
+      return rejectReport();
+    }
+
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.some((key) => typeof key === "symbol")) return rejectReport();
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (
+      ownKeys.some((key) => {
+        if (Array.isArray(value) && key === "length") return false;
+        const descriptor = descriptors[key as string];
+        return (
+          descriptor === undefined ||
+          !descriptor.enumerable ||
+          !("value" in descriptor)
+        );
+      })
+    ) {
+      return rejectReport();
+    }
+
+    ancestors.add(value);
+    try {
+      if (Array.isArray(value)) {
+        if (
+          ownKeys.length !== value.length + 1 ||
+          ownKeys.at(-1) !== "length"
+        ) {
+          return rejectReport();
+        }
+        const snapshot: JsonSnapshot[] = [];
+        for (let index = 0; index < value.length; index += 1) {
+          const key = String(index);
+          if (ownKeys[index] !== key) return rejectReport();
+          const descriptor = descriptors[key];
+          if (descriptor === undefined || !("value" in descriptor)) {
+            return rejectReport();
+          }
+          snapshot.push(visit(descriptor.value, depth + 1));
+        }
+        return snapshot;
+      }
+
+      const snapshot: { [key: string]: JsonSnapshot } = {};
+      for (const key of ownKeys as string[]) {
+        if (key === "toJSON") return rejectReport();
+        const descriptor = descriptors[key];
+        if (descriptor === undefined || !("value" in descriptor)) {
+          return rejectReport();
+        }
+        Object.defineProperty(snapshot, key, {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: visit(descriptor.value, depth + 1),
+        });
+      }
+      return snapshot;
+    } finally {
+      ancestors.delete(value);
+    }
+  };
+
+  return visit(root, 0);
 };
 
-const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
+const cloneJson = <Value>(value: Value): Value =>
+  snapshotJsonOrigin(value) as Value;
+
+const serializeJsonSnapshot = (value: JsonSnapshot): string => {
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
   }
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  if (Array.isArray(value)) {
+    return `[${value.map(serializeJsonSnapshot).join(",")}]`;
+  }
+  return `{${Object.entries(value)
+    .map(([key, child]) => `${JSON.stringify(key)}:${serializeJsonSnapshot(child)}`)
+    .join(",")}}`;
 };
 
 const hasExactOwnKeys = (
@@ -139,10 +244,31 @@ const hasExactOwnKeys = (
   );
 };
 
+const containsSensitivePathBasename = (value: string): boolean =>
+  value.split(/[/\\]/).some((segment) => {
+    const basename = segment.match(/^[^\s"'`()\[\]{},;<>]+/)?.[0];
+    return (
+      basename !== undefined && SENSITIVE_PATH_BASENAME_PATTERN.test(basename)
+    );
+  });
+
+const containsSensitiveString = (value: string): boolean => {
+  if (containsSensitivePathBasename(value)) return true;
+  for (const pattern of SENSITIVE_STRING_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(value)) return true;
+  }
+  return false;
+};
+
+const SENSITIVE_METADATA_PATTERN =
+  /(?:^|[-_.])(?:authorization|api[-_]?key|token|password|passwd|secret|credential|credentials)(?:[-_.]|$)/i;
+
 const validPublicMetadata = (value: unknown): value is string =>
   typeof value === "string" &&
   PUBLIC_ID_PATTERN.test(value) &&
-  !SECRET_METADATA_PATTERN.test(value);
+  !SENSITIVE_METADATA_PATTERN.test(value) &&
+  !containsSensitiveString(value);
 
 const validReviewedFile = (value: unknown): value is string => {
   if (
@@ -150,8 +276,7 @@ const validReviewedFile = (value: unknown): value is string => {
     value.length < 1 ||
     value.length > 512 ||
     value.includes("\\") ||
-    !RELATIVE_REPO_PATH_PATTERN.test(value) ||
-    SECRET_METADATA_PATTERN.test(value)
+    !RELATIVE_REPO_PATH_PATTERN.test(value)
   ) {
     return false;
   }
@@ -162,13 +287,103 @@ const validReviewedFile = (value: unknown): value is string => {
   const baseName = segments.at(-1)!;
   return (
     !SECRET_FILE_BASENAME_PATTERN.test(baseName) &&
-    !SECRET_FILE_EXTENSION_PATTERN.test(baseName) &&
-    !/(?:^|[-_.])token(?:[-_.]|$)/i.test(baseName)
+    !SENSITIVE_PATH_BASENAME_PATTERN.test(baseName)
   );
 };
 
-const normalizedSensitiveKey = (key: string): string =>
-  key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+const sensitiveKeyWords = (key: string): string[] =>
+  key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter((word) => word.length > 0)
+    .map((word) => word.toLowerCase());
+
+const hasAdjacentWords = (
+  words: readonly string[],
+  first: string,
+  second: string,
+): boolean =>
+  words.some((word, index) => word === first && words[index + 1] === second);
+
+const SENSITIVE_KEY_SUFFIXES = [
+  "authorizationheader",
+  "authorization",
+  "openaikey",
+  "apikey",
+  "accesstoken",
+  "refreshtoken",
+  "sessiontoken",
+  "oauthtoken",
+  "githubtoken",
+  "token",
+  "clientsecret",
+  "secret",
+  "credentials",
+  "credential",
+  "password",
+  "passwd",
+  "developerprompt",
+  "systemprompt",
+  "userprompt",
+  "rawprompt",
+  "prompt",
+  "authpath",
+  "oauthpath",
+  "repopath",
+  "privatekey",
+  "rawerror",
+  "errordetail",
+  "errormessage",
+  "errorstack",
+  "environmentname",
+  "environment",
+  "env",
+  "accesskeyid",
+  "secretaccesskey",
+  "awssecretaccesskey",
+] as const;
+
+const isSensitiveDurableKey = (key: string): boolean => {
+  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  if (
+    SENSITIVE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
+  ) {
+    return true;
+  }
+
+  const words = sensitiveKeyWords(key);
+  const last = words.at(-1);
+  if (last === undefined) return false;
+  if (["env", "environment", "authorization", "passwd"].includes(last)) {
+    return true;
+  }
+  if (last === "credential" || last === "credentials") return true;
+  if (last === "password" || last === "secret" || last === "token") {
+    return true;
+  }
+  return (
+    hasAdjacentWords(words, "api", "key") ||
+    hasAdjacentWords(words, "private", "key") ||
+    hasAdjacentWords(words, "client", "secret") ||
+    hasAdjacentWords(words, "authorization", "header") ||
+    hasAdjacentWords(words, "auth", "path") ||
+    hasAdjacentWords(words, "oauth", "path") ||
+    hasAdjacentWords(words, "repo", "path") ||
+    hasAdjacentWords(words, "error", "detail") ||
+    hasAdjacentWords(words, "error", "message") ||
+    hasAdjacentWords(words, "error", "stack") ||
+    hasAdjacentWords(words, "raw", "prompt") ||
+    hasAdjacentWords(words, "raw", "error") ||
+    hasAdjacentWords(words, "system", "prompt") ||
+    hasAdjacentWords(words, "user", "prompt") ||
+    hasAdjacentWords(words, "developer", "prompt") ||
+    hasAdjacentWords(words, "session", "token") ||
+    hasAdjacentWords(words, "access", "token") ||
+    hasAdjacentWords(words, "refresh", "token") ||
+    hasAdjacentWords(words, "oauth", "token")
+  );
+};
 
 const containsSensitiveDurableValue = (root: unknown): boolean => {
   const pending: Array<{ value: unknown; depth: number }> = [
@@ -181,14 +396,14 @@ const containsSensitiveDurableValue = (root: unknown): boolean => {
     if (entry === undefined) return true;
     visited += 1;
     if (
-      visited > MAX_SENSITIVE_SCAN_NODES ||
-      entry.depth > MAX_SENSITIVE_SCAN_DEPTH
+      visited > MAX_REPORT_JSON_NODES ||
+      entry.depth > MAX_REPORT_JSON_DEPTH
     ) {
       return true;
     }
 
     if (typeof entry.value === "string") {
-      if (SENSITIVE_STRING_PATTERN.test(entry.value)) return true;
+      if (containsSensitiveString(entry.value)) return true;
       continue;
     }
     if (
@@ -199,16 +414,16 @@ const containsSensitiveDurableValue = (root: unknown): boolean => {
       continue;
     }
     if (Array.isArray(entry.value)) {
-      if (entry.depth === MAX_SENSITIVE_SCAN_DEPTH) return true;
+      if (entry.depth === MAX_REPORT_JSON_DEPTH) return true;
       for (const value of entry.value) {
         pending.push({ value, depth: entry.depth + 1 });
       }
       continue;
     }
     if (!isPlainRecord(entry.value)) return true;
-    if (entry.depth === MAX_SENSITIVE_SCAN_DEPTH) return true;
+    if (entry.depth === MAX_REPORT_JSON_DEPTH) return true;
     for (const [key, value] of Object.entries(entry.value)) {
-      if (SENSITIVE_KEY_NAMES.has(normalizedSensitiveKey(key))) return true;
+      if (isSensitiveDurableKey(key)) return true;
       pending.push({ value, depth: entry.depth + 1 });
     }
   }
@@ -218,12 +433,11 @@ const containsSensitiveDurableValue = (root: unknown): boolean => {
 
 const parseInputSnapshot = (input: ReportInput): ReportInput => {
   try {
-    if (!isPlainRecord(input)) return rejectReport();
-    const serializedInput = JSON.stringify(input);
+    const snapshotValue = snapshotJsonOrigin(input);
+    const serializedInput = serializeJsonSnapshot(snapshotValue);
     if (Buffer.byteLength(serializedInput, "utf8") > REPORT_MAX_BYTES) {
       return rejectReport();
     }
-    const snapshotValue: unknown = JSON.parse(serializedInput);
     if (
       !isPlainRecord(snapshotValue) ||
       !hasExactOwnKeys(snapshotValue, [
@@ -237,6 +451,9 @@ const parseInputSnapshot = (input: ReportInput): ReportInput => {
         "durations",
       ])
     ) {
+      return rejectReport();
+    }
+    if (containsSensitiveDurableValue(snapshotValue)) {
       return rejectReport();
     }
     const snapshot = snapshotValue as unknown as ReportInput;
@@ -281,14 +498,6 @@ const parseInputSnapshot = (input: ReportInput): ReportInput => {
       .array()
       .max(50)
       .parse(snapshot.patchedResults);
-
-    if (
-      containsSensitiveDurableValue(hypotheses) ||
-      containsSensitiveDurableValue(vulnerableResults) ||
-      containsSensitiveDurableValue(patchedResults)
-    ) {
-      return rejectReport();
-    }
 
     if (
       snapshot.durations === null ||
@@ -419,7 +628,11 @@ export const createRunReport = (input: ReportInput): RunReport => {
   };
 
   try {
-    const serialized = JSON.stringify(report);
+    const reportSnapshot = snapshotJsonOrigin(report);
+    if (containsSensitiveDurableValue(reportSnapshot)) {
+      return rejectReport();
+    }
+    const serialized = serializeJsonSnapshot(reportSnapshot);
     if (Buffer.byteLength(serialized, "utf8") > REPORT_MAX_BYTES) {
       return rejectReport();
     }

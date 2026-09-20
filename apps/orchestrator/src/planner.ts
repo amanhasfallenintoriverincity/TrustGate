@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { TextDecoder } from "node:util";
 
 import {
   analysisPlanSchema,
@@ -26,6 +27,13 @@ type SerializedPlannerInput = {
   diffs: FileDiff[];
 };
 
+type ValidatedPlannerInput = {
+  mode: ReviewInput["mode"];
+  files: ReviewInput["files"];
+  ruleGroups: ReviewInput["ruleGroups"];
+  diffs: FileDiff[];
+};
+
 type ChangedLine = { line: number; text: string };
 
 type HunkState = {
@@ -33,74 +41,344 @@ type HunkState = {
   newLine: number;
   oldRemaining: number;
   newRemaining: number;
+  markerAllowed: boolean;
 };
 
+type ParsedEnvelopePath = { kind: "path"; path: string } | { kind: "null" };
+
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/;
+const DIFF_PREFIX = "diff --git ";
+const OLD_HEADER_PREFIX = "--- ";
+const NEW_HEADER_PREFIX = "+++ ";
+const NO_NEWLINE_MARKER = "\\ No newline at end of file";
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
-const collectChangedLines = (diff: string): ChangedLine[] => {
-  const changedLines: ChangedLine[] = [];
-  let hunk: HunkState | undefined;
+const invalidDiff = (path: string, reason: string): never => {
+  throw new Error(`Invalid diff for ${path}: ${reason}`);
+};
 
-  for (const line of diff.split("\n")) {
-    const header = HUNK_HEADER.exec(line);
-    if (header !== null) {
-      hunk = {
-        oldLine: Number(header[1]),
-        newLine: Number(header[3]),
-        oldRemaining: Number(header[2] ?? "1"),
-        newRemaining: Number(header[4] ?? "1"),
-      };
-      continue;
-    }
-    if (hunk === undefined || line.startsWith("\\ No newline at end of file")) {
-      continue;
-    }
-    if (hunk.oldRemaining === 0 && hunk.newRemaining === 0) {
-      hunk = undefined;
-      continue;
-    }
-
-    if (line.startsWith("+")) {
-      if (hunk.newRemaining === 0) {
-        hunk = undefined;
-        continue;
-      }
-      changedLines.push({ line: hunk.newLine, text: line.slice(1) });
-      hunk.newLine += 1;
-      hunk.newRemaining -= 1;
-      continue;
-    }
-    if (line.startsWith("-")) {
-      if (hunk.oldRemaining === 0) {
-        hunk = undefined;
-        continue;
-      }
-      changedLines.push({ line: hunk.oldLine, text: line.slice(1) });
-      hunk.oldLine += 1;
-      hunk.oldRemaining -= 1;
-      continue;
-    }
-    if (line.startsWith(" ")) {
-      if (hunk.oldRemaining === 0 || hunk.newRemaining === 0) {
-        hunk = undefined;
-        continue;
-      }
-      hunk.oldLine += 1;
-      hunk.newLine += 1;
-      hunk.oldRemaining -= 1;
-      hunk.newRemaining -= 1;
-      continue;
-    }
-
-    hunk = undefined;
+const decodeGitQuotedToken = (token: string): string | null => {
+  if (token.length < 2 || token[0] !== '"' || token.at(-1) !== '"') {
+    return null;
   }
 
+  const bytes: number[] = [];
+  for (let index = 1; index < token.length - 1; index += 1) {
+    const character = token[index]!;
+    if (character !== "\\") {
+      const nextEscape = token.indexOf("\\", index);
+      const end = nextEscape === -1 ? token.length - 1 : nextEscape;
+      bytes.push(...Buffer.from(token.slice(index, end), "utf8"));
+      index = end - 1;
+      continue;
+    }
+
+    index += 1;
+    if (index >= token.length - 1) return null;
+    const escape = token[index]!;
+    const simpleEscapes: Record<string, number> = {
+      '"': 0x22,
+      "\\": 0x5c,
+      t: 0x09,
+      n: 0x0a,
+      r: 0x0d,
+    };
+    const simple = simpleEscapes[escape];
+    if (simple !== undefined) {
+      bytes.push(simple);
+      continue;
+    }
+    if (!/[0-7]/.test(escape)) return null;
+
+    let octal = escape;
+    while (
+      octal.length < 3 &&
+      index + 1 < token.length - 1 &&
+      /[0-7]/.test(token[index + 1]!)
+    ) {
+      index += 1;
+      octal += token[index]!;
+    }
+    const byte = Number.parseInt(octal, 8);
+    if (byte > 0xff) return null;
+    bytes.push(byte);
+  }
+
+  try {
+    return UTF8_DECODER.decode(Uint8Array.from(bytes));
+  } catch {
+    return null;
+  }
+};
+
+const readGitToken = (
+  source: string,
+  offset: number,
+): { value: string; next: number } | null => {
+  if (offset >= source.length) return null;
+  if (source[offset] !== '"') {
+    const end = source.indexOf(" ", offset);
+    const next = end === -1 ? source.length : end;
+    if (next === offset) return null;
+    return { value: source.slice(offset, next), next };
+  }
+
+  let escaped = false;
+  for (let index = offset + 1; index < source.length; index += 1) {
+    const character = source[index]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      const token = source.slice(offset, index + 1);
+      const decoded = decodeGitQuotedToken(token);
+      return decoded === null ? null : { value: decoded, next: index + 1 };
+    }
+  }
+  return null;
+};
+
+const parseDiffEnvelope = (line: string): [string, string] | null => {
+  if (!line.startsWith(DIFF_PREFIX)) return null;
+  const source = line.slice(DIFF_PREFIX.length);
+  const oldToken = readGitToken(source, 0);
+  if (oldToken === null || source[oldToken.next] !== " ") return null;
+  const newToken = readGitToken(source, oldToken.next + 1);
+  if (newToken === null || newToken.next !== source.length) return null;
+  return [oldToken.value, newToken.value];
+};
+
+const parseFileHeader = (
+  token: string,
+  prefix: "a/" | "b/",
+): ParsedEnvelopePath | null => {
+  if (token === "/dev/null") return { kind: "null" };
+  const decoded = token.startsWith('"') ? decodeGitQuotedToken(token) : token;
+  if (decoded === null || !decoded.startsWith(prefix)) return null;
+  return { kind: "path", path: decoded.slice(prefix.length) };
+};
+
+type DiffKind = "modify" | "add" | "delete";
+type DeclaredDiffKind = DiffKind | "unspecified";
+
+const metadataKind = (line: string): DiffKind | null | undefined => {
+  if (/^new file mode [0-7]{6}$/.test(line)) return "add";
+  if (/^deleted file mode [0-7]{6}$/.test(line)) return "delete";
+  if (
+    /^(?:index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?|old mode [0-7]{6}|new mode [0-7]{6})$/.test(
+      line,
+    )
+  ) {
+    return null;
+  }
+  return undefined;
+};
+
+const collectChangedLines = ({
+  path,
+  diff,
+  truncated,
+}: FileDiff): ChangedLine[] => {
+  const lines = diff.split("\n");
+  if (diff.endsWith("\n")) lines.pop();
+  if (lines.length === 0 || lines[0] === "") {
+    return invalidDiff(path, "missing diff --git envelope");
+  }
+
+  const envelope = parseDiffEnvelope(lines[0]!);
+  if (envelope === null) {
+    return invalidDiff(path, "malformed diff --git envelope");
+  }
+  if (envelope[0] !== `a/${path}` || envelope[1] !== `b/${path}`) {
+    return invalidDiff(path, "envelope path mismatch");
+  }
+
+  const changedLines: ChangedLine[] = [];
+  let index = 1;
+  let oldHeader: ParsedEnvelopePath | undefined;
+  let newHeader: ParsedEnvelopePath | undefined;
+  let declaredKind: DeclaredDiffKind = "unspecified";
+  let hunk: HunkState | undefined;
+  let sawHunk = false;
+
+  while (index < lines.length) {
+    const line = lines[index]!;
+    if (line.startsWith(DIFF_PREFIX)) {
+      return invalidDiff(path, "multiple file sections are not allowed");
+    }
+
+    if (hunk !== undefined) {
+      const complete = hunk.oldRemaining === 0 && hunk.newRemaining === 0;
+      if (line === NO_NEWLINE_MARKER) {
+        if (!hunk.markerAllowed) {
+          return invalidDiff(path, "misplaced no-newline marker");
+        }
+        hunk.markerAllowed = false;
+        index += 1;
+        continue;
+      }
+      if (complete) {
+        hunk = undefined;
+        if (!line.startsWith("@@ ")) {
+          return invalidDiff(path, "line outside declared hunk counts");
+        }
+        continue;
+      }
+      if (line.startsWith("@@ ")) {
+        return invalidDiff(path, "next hunk starts before current hunk is complete");
+      }
+
+      const prefix = line[0];
+      if (prefix === "+") {
+        if (hunk.newRemaining === 0) {
+          return invalidDiff(path, "added line exceeds declared hunk count");
+        }
+        changedLines.push({ line: hunk.newLine, text: line.slice(1) });
+        hunk.newLine += 1;
+        hunk.newRemaining -= 1;
+      } else if (prefix === "-") {
+        if (hunk.oldRemaining === 0) {
+          return invalidDiff(path, "deleted line exceeds declared hunk count");
+        }
+        changedLines.push({ line: hunk.oldLine, text: line.slice(1) });
+        hunk.oldLine += 1;
+        hunk.oldRemaining -= 1;
+      } else if (prefix === " ") {
+        if (hunk.oldRemaining === 0 || hunk.newRemaining === 0) {
+          return invalidDiff(path, "context line exceeds declared hunk count");
+        }
+        hunk.oldLine += 1;
+        hunk.newLine += 1;
+        hunk.oldRemaining -= 1;
+        hunk.newRemaining -= 1;
+      } else {
+        return invalidDiff(path, "malformed hunk body prefix");
+      }
+      hunk.markerAllowed = true;
+      index += 1;
+      continue;
+    }
+
+    if (oldHeader === undefined) {
+      if (line.startsWith(OLD_HEADER_PREFIX)) {
+        const parsed = parseFileHeader(line.slice(OLD_HEADER_PREFIX.length), "a/");
+        if (parsed === null) return invalidDiff(path, "malformed old file header");
+        oldHeader = parsed;
+        index += 1;
+        continue;
+      }
+      if (
+        line.startsWith(NEW_HEADER_PREFIX) ||
+        line.startsWith("@@ ") ||
+        line.startsWith("Binary files ") ||
+        line === "GIT binary patch"
+      ) {
+        return invalidDiff(path, "unexpected content before file headers");
+      }
+      const kind = metadataKind(line);
+      if (kind === undefined) {
+        return invalidDiff(path, "unexpected content before file headers");
+      }
+      if (kind !== null) {
+        if (declaredKind !== "unspecified" && declaredKind !== kind) {
+          return invalidDiff(path, "conflicting file mode metadata");
+        }
+        declaredKind = kind;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (newHeader === undefined) {
+      if (!line.startsWith(NEW_HEADER_PREFIX)) {
+        return invalidDiff(path, "new file header must follow old file header");
+      }
+      const parsed = parseFileHeader(line.slice(NEW_HEADER_PREFIX.length), "b/");
+      if (parsed === null) return invalidDiff(path, "malformed new file header");
+      newHeader = parsed;
+
+      const validModification =
+        oldHeader.kind === "path" &&
+        oldHeader.path === path &&
+        newHeader.kind === "path" &&
+        newHeader.path === path;
+      const validAddition =
+        oldHeader.kind === "null" &&
+        newHeader.kind === "path" &&
+        newHeader.path === path;
+      const validDeletion =
+        oldHeader.kind === "path" &&
+        oldHeader.path === path &&
+        newHeader.kind === "null";
+      const headerKind: DiffKind | null = validModification
+        ? "modify"
+        : validAddition
+          ? "add"
+          : validDeletion
+            ? "delete"
+            : null;
+      if (
+        headerKind === null ||
+        (declaredKind !== "unspecified" && declaredKind !== headerKind)
+      ) {
+        return invalidDiff(path, "file header path mismatch or invalid /dev/null side");
+      }
+      declaredKind = headerKind;
+      index += 1;
+      continue;
+    }
+
+    const header = HUNK_HEADER.exec(line);
+    if (header === null) {
+      return invalidDiff(path, "expected hunk header");
+    }
+    const oldLine = Number(header[1]);
+    const newLine = Number(header[3]);
+    const oldRemaining = Number(header[2] ?? "1");
+    const newRemaining = Number(header[4] ?? "1");
+    if (
+      !Number.isSafeInteger(oldLine) ||
+      !Number.isSafeInteger(newLine) ||
+      !Number.isSafeInteger(oldRemaining) ||
+      !Number.isSafeInteger(newRemaining)
+    ) {
+      return invalidDiff(path, "hunk coordinates must be safe integers");
+    }
+    if (declaredKind === "add" && oldRemaining !== 0) {
+      return invalidDiff(path, "added-file hunk must not consume old lines");
+    }
+    if (declaredKind === "delete" && newRemaining !== 0) {
+      return invalidDiff(path, "deleted-file hunk must not consume new lines");
+    }
+    hunk = {
+      oldLine,
+      newLine,
+      oldRemaining,
+      newRemaining,
+      markerAllowed: false,
+    };
+    sawHunk = true;
+    index += 1;
+  }
+
+  if (oldHeader === undefined || newHeader === undefined) {
+    return invalidDiff(path, "missing file headers");
+  }
+  if (hunk !== undefined && (hunk.oldRemaining !== 0 || hunk.newRemaining !== 0)) {
+    if (!truncated) return invalidDiff(path, "incomplete hunk at end of input");
+  }
+  if (!sawHunk) return [];
   return changedLines;
 };
 
 const validateEvidence = (plan: AnalysisPlan, diffs: FileDiff[]): void => {
   const changedLinesByPath = new Map(
-    diffs.map(({ path, diff }) => [path, collectChangedLines(diff)]),
+    diffs.map((fileDiff) => [fileDiff.path, collectChangedLines(fileDiff)]),
   );
 
   for (const hypothesis of plan.hypotheses) {
@@ -130,27 +408,126 @@ const validateEvidence = (plan: AnalysisPlan, diffs: FileDiff[]): void => {
   }
 };
 
-const serializeInput = (input: PlannerInput): string => {
-  if (input.files.length === 0 || input.diffs.length === 0) {
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const requireNonEmptyString = (value: unknown, field: string): string => {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${field} must be a non-empty string`);
+  }
+  return value;
+};
+
+const requireCount = (value: unknown, field: string): number => {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 0
+  ) {
+    throw new TypeError(`${field} must be a nonnegative safe integer`);
+  }
+  return value;
+};
+
+const readStable = <T>(
+  object: Record<string, unknown>,
+  key: string,
+  field: string,
+  validate: (value: unknown, field: string) => T,
+): T => {
+  const first = validate(object[key], field);
+  const second = validate(object[key], field);
+  if (!Object.is(first, second)) {
+    throw new TypeError(`${field} changed during validation`);
+  }
+  return first;
+};
+
+const invalidInput = (message: string): never => {
+  throw new TypeError(message);
+};
+
+const serializeInput = (
+  input: PlannerInput,
+): { serialized: string; validated: ValidatedPlannerInput } => {
+  const candidate: unknown = input;
+  if (!isObject(candidate)) {
+    throw new TypeError("input must be an object");
+  }
+  if (
+    candidate.mode !== "workspace" &&
+    candidate.mode !== "range" &&
+    candidate.mode !== "commit"
+  ) {
+    throw new TypeError("mode must be workspace, range, or commit");
+  }
+  if (!Array.isArray(candidate.files)) {
+    throw new TypeError("files must be an array");
+  }
+  if (!Array.isArray(candidate.ruleGroups)) {
+    throw new TypeError("ruleGroups must be an array");
+  }
+  if (!Array.isArray(candidate.diffs)) {
+    throw new TypeError("diffs must be an array");
+  }
+  const validatedInput = candidate as unknown as PlannerInput;
+  if (validatedInput.files.length === 0 || validatedInput.diffs.length === 0) {
     throw new Error("review files and diffs must be non-empty");
   }
 
   const reviewPaths = new Set<string>();
-  for (const [index, file] of input.files.entries()) {
-    if (typeof file.path !== "string") {
-      throw new TypeError(`review files[${index}].path must be a string`);
+  const serializedFiles = validatedInput.files.map((file, index) => {
+    if (!isObject(file)) {
+      throw new TypeError(`files[${index}] must be an object`);
     }
-    if (reviewPaths.has(file.path)) {
-      throw new Error(`duplicate review file path: ${file.path}`);
+    const path = readStable(
+      file,
+      "path",
+      `review files[${index}].path`,
+      requireNonEmptyString,
+    );
+    const serializedFile = {
+      path,
+      status: readStable(
+        file,
+        "status",
+        `review files[${index}].status`,
+        requireNonEmptyString,
+      ),
+      additions: readStable(
+        file,
+        "additions",
+        `review files[${index}].additions`,
+        requireCount,
+      ),
+      deletions: readStable(
+        file,
+        "deletions",
+        `review files[${index}].deletions`,
+        requireCount,
+      ),
+    };
+    if (reviewPaths.has(path)) {
+      throw new Error(`duplicate review file path: ${path}`);
     }
-    reviewPaths.add(file.path);
-  }
+    reviewPaths.add(path);
+    return serializedFile;
+  });
 
-  if (input.ruleGroups.length === 0) {
+  if (validatedInput.ruleGroups.length === 0) {
     throw new Error("rule groups must be non-empty");
   }
   const groupedPaths = new Set<string>();
-  for (const [groupIndex, group] of input.ruleGroups.entries()) {
+  for (const [groupIndex, group] of validatedInput.ruleGroups.entries()) {
+    if (!isObject(group)) {
+      throw new TypeError(`ruleGroups[${groupIndex}] must be an object`);
+    }
+    if (!Array.isArray(group.files)) {
+      throw new TypeError(`ruleGroups[${groupIndex}].files must be an array`);
+    }
+    if (typeof group.rules !== "string") {
+      throw new TypeError(`ruleGroups[${groupIndex}].rules must be a string`);
+    }
     if (group.files.length === 0) {
       throw new Error(`ruleGroups[${groupIndex}].files must be non-empty`);
     }
@@ -176,15 +553,16 @@ const serializeInput = (input: PlannerInput): string => {
   }
 
   const diffsByPath = new Map<string, FileDiff>();
-  for (const [index, fileDiff] of input.diffs.entries()) {
-    if (typeof fileDiff.path !== "string") {
-      throw new TypeError(`diffs[${index}].path must be a string`);
+  for (const [index, fileDiff] of validatedInput.diffs.entries()) {
+    if (!isObject(fileDiff)) {
+      throw new TypeError(`diffs[${index}] must be an object`);
     }
-    if (diffsByPath.has(fileDiff.path)) {
-      throw new Error(`duplicate diff path: ${fileDiff.path}`);
+    const path = requireNonEmptyString(fileDiff.path, `diffs[${index}].path`);
+    if (diffsByPath.has(path)) {
+      throw new Error(`duplicate diff path: ${path}`);
     }
-    if (!reviewPaths.has(fileDiff.path)) {
-      throw new Error(`unknown diff path: ${fileDiff.path}`);
+    if (!reviewPaths.has(path)) {
+      throw new Error(`unknown diff path: ${path}`);
     }
     if (typeof fileDiff.diff !== "string") {
       throw new TypeError(`diffs[${index}].diff must be a string`);
@@ -192,36 +570,56 @@ const serializeInput = (input: PlannerInput): string => {
     if (typeof fileDiff.truncated !== "boolean") {
       throw new TypeError(`diffs[${index}].truncated must be a boolean`);
     }
-    diffsByPath.set(fileDiff.path, fileDiff);
+    diffsByPath.set(path, fileDiff as FileDiff);
   }
 
-  const orderedDiffs = input.files.map(({ path }) => {
+  const orderedDiffs = validatedInput.files.map(({ path }) => {
     const fileDiff = diffsByPath.get(path);
     if (fileDiff === undefined) {
       throw new Error(`missing diff path: ${path}`);
     }
     return {
-      path: fileDiff.path,
-      diff: fileDiff.diff,
-      truncated: fileDiff.truncated,
+      path: requireNonEmptyString(fileDiff.path, `diff for ${path}.path`),
+      diff:
+        typeof fileDiff.diff === "string"
+          ? fileDiff.diff
+          : invalidInput(`diff for ${path}.diff must be a string`),
+      truncated:
+        typeof fileDiff.truncated === "boolean"
+          ? fileDiff.truncated
+          : invalidInput(`diff for ${path}.truncated must be a boolean`),
     };
   });
 
+  const serializedRuleGroups = validatedInput.ruleGroups.map(
+    (group, groupIndex) => {
+      if (!Array.isArray(group.files) || typeof group.rules !== "string") {
+        throw new TypeError(`ruleGroups[${groupIndex}] changed during validation`);
+      }
+      const files = group.files.map((filePath, fileIndex) => {
+        if (typeof filePath !== "string") {
+          throw new TypeError(
+            `ruleGroups[${groupIndex}].files[${fileIndex}] must be a string`,
+          );
+        }
+        return filePath;
+      });
+      return { files, rules: group.rules };
+    },
+  );
+  const validated: ValidatedPlannerInput = {
+    mode: validatedInput.mode,
+    files: serializedFiles,
+    ruleGroups: serializedRuleGroups,
+    diffs: orderedDiffs,
+  };
   const serializedInput: SerializedPlannerInput = {
     review: {
-      mode: input.mode,
-      files: input.files.map(({ path, status, additions, deletions }) => ({
-        path,
-        status,
-        additions,
-        deletions,
-      })),
-      ruleGroups: input.ruleGroups.map(({ files, rules }) => ({
-        files: [...files],
-        rules,
-      })),
+      mode: validated.mode,
+      files: validated.files,
+      ruleGroups: validated.ruleGroups,
     },
-    diffs: orderedDiffs,
+    diffs: validated.diffs,
   };
   const serialized = JSON.stringify(serializedInput);
   if (Buffer.byteLength(serialized, "utf8") > PLANNER_INPUT_MAX_BYTES) {
@@ -229,20 +627,20 @@ const serializeInput = (input: PlannerInput): string => {
       `Planner input exceeds ${PLANNER_INPUT_MAX_BYTES} UTF-8 bytes`,
     );
   }
-  return serialized;
+  return { serialized, validated };
 };
 
 export const createSecurityPlanner = (client: LlmClient) => ({
   async plan(input: PlannerInput): Promise<AnalysisPlan> {
-    const serializedInput = serializeInput(input);
+    const { serialized, validated } = serializeInput(input);
     const response = await client.generate({
       system: SECURITY_PLAN_SYSTEM,
-      messages: [{ role: "user", content: serializedInput }],
+      messages: [{ role: "user", content: serialized }],
       temperature: 0,
       maxTokens: 3000,
     });
     const plan = parseContractJson(analysisPlanSchema, response.text);
-    validateEvidence(plan, input.diffs);
+    validateEvidence(plan, validated.diffs);
     return plan;
   },
 });

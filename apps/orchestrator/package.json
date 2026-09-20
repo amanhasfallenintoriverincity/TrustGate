@@ -25,6 +25,10 @@
     "./spec-runner": {
       "types": "./dist/spec-runner.d.ts",
       "default": "./dist/spec-runner.js"
+    },
+    "./sandbox-policy": {
+      "types": "./dist/sandbox-policy.d.ts",
+      "default": "./dist/sandbox-policy.js"
     }
   },
   "engines": {

@@ -1,0 +1,33 @@
+# Deny the repository build context by default. Task 9 copies no host files.
+**
+
+# Explicitly document sensitive and generated paths as excluded.
+.git
+.git/**
+.hermes
+.hermes/**
+**/node_modules
+**/node_modules/**
+**/dist
+**/dist/**
+**/test
+**/test/**
+**/tests
+**/tests/**
+**/*.test.*
+**/*.spec.*
+docs
+**/docs/**
+**/*.hwp
+**/*.hwpx
+**/.env
+**/.env.*
+**/*secret*
+**/*credential*
+**/*auth*
+**/*token*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.log

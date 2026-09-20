@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { buildSandboxArgs } from "../src/sandbox-policy.js";
@@ -10,9 +11,24 @@ const vulnerableArgs = [
   "--rm",
   "--name",
   "trustgate-target-vulnerable",
+  "--pull",
+  "never",
+  "--http-proxy=false",
+  "--unsetenv-all",
   "--network",
   "none",
+  "--pid",
+  "private",
+  "--ipc",
+  "private",
+  "--uts",
+  "private",
+  "--cgroupns",
+  "private",
   "--read-only",
+  "--read-only-tmpfs=false",
+  "--image-volume",
+  "ignore",
   "--tmpfs",
   "/tmp:rw,noexec,nosuid,nodev,size=16m",
   "--cap-drop",
@@ -33,6 +49,8 @@ const vulnerableArgs = [
   "HOME=/tmp",
   "--env",
   "NODE_ENV=production",
+  "--env",
+  "PATH=/usr/local/bin:/usr/bin:/bin",
   "--workdir",
   "/app",
   image,
@@ -43,9 +61,24 @@ const patchedArgs = [
   "--rm",
   "--name",
   "trustgate-target-patched",
+  "--pull",
+  "never",
+  "--http-proxy=false",
+  "--unsetenv-all",
   "--network",
   "none",
+  "--pid",
+  "private",
+  "--ipc",
+  "private",
+  "--uts",
+  "private",
+  "--cgroupns",
+  "private",
   "--read-only",
+  "--read-only-tmpfs=false",
+  "--image-volume",
+  "ignore",
   "--tmpfs",
   "/tmp:rw,noexec,nosuid,nodev,size=16m",
   "--cap-drop",
@@ -66,6 +99,8 @@ const patchedArgs = [
   "HOME=/tmp",
   "--env",
   "NODE_ENV=production",
+  "--env",
+  "PATH=/usr/local/bin:/usr/bin:/bin",
   "--workdir",
   "/app",
   image,
@@ -205,8 +240,17 @@ test("policy options are not duplicated", () => {
   const singleOptions = [
     "--rm",
     "--name",
+    "--pull",
+    "--http-proxy=false",
+    "--unsetenv-all",
     "--network",
+    "--pid",
+    "--ipc",
+    "--uts",
+    "--cgroupns",
     "--read-only",
+    "--read-only-tmpfs=false",
+    "--image-volume",
     "--tmpfs",
     "--cap-drop",
     "--security-opt",
@@ -220,7 +264,7 @@ test("policy options are not duplicated", () => {
   for (const option of singleOptions) {
     assert.equal(args.filter((value) => value === option).length, 1, option);
   }
-  assert.equal(args.filter((value) => value === "--env").length, 3);
+  assert.equal(args.filter((value) => value === "--env").length, 4);
 });
 
 test("policy contains no forbidden flags or secret substrings", () => {
@@ -233,9 +277,6 @@ test("policy contains no forbidden flags or secret substrings", () => {
     "--publish",
     "-p",
     "--privileged",
-    "--pid",
-    "--ipc",
-    "--uts",
     "--userns",
     "--env-file",
     "--env-host",
@@ -273,7 +314,7 @@ test("the image is the final argv value after every Podman option", () => {
   assert.equal(args.filter((value) => value === image).length, 1);
 });
 
-test("environment allowlist contains exactly three fixed values", () => {
+test("environment allowlist contains exactly four fixed values", () => {
   const args = buildSandboxArgs(image, "patched");
   const environment: string[] = [];
 
@@ -285,10 +326,11 @@ test("environment allowlist contains exactly three fixed values", () => {
     "TARGET_MODE=patched",
     "HOME=/tmp",
     "NODE_ENV=production",
+    "PATH=/usr/local/bin:/usr/bin:/bin",
   ]);
   assert.deepEqual(
     environment.map((value) => value.slice(0, value.indexOf("="))),
-    ["TARGET_MODE", "HOME", "NODE_ENV"],
+    ["TARGET_MODE", "HOME", "NODE_ENV", "PATH"],
   );
 });
 
@@ -299,4 +341,137 @@ test("tmpfs policy is exact and includes nodev", () => {
     args[args.indexOf("--tmpfs") + 1],
     "/tmp:rw,noexec,nosuid,nodev,size=16m",
   );
+});
+
+test("Podman host defaults are explicitly closed fail-safe", () => {
+  const args = buildSandboxArgs(image, "vulnerable");
+
+  for (const [option, value] of [
+    ["--pull", "never"],
+    ["--network", "none"],
+    ["--pid", "private"],
+    ["--ipc", "private"],
+    ["--uts", "private"],
+    ["--cgroupns", "private"],
+    ["--image-volume", "ignore"],
+    ["--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m"],
+  ] as const) {
+    const optionIndex = args.indexOf(option);
+    assert.notEqual(optionIndex, -1, option);
+    assert.equal(args[optionIndex + 1], value, option);
+  }
+
+  for (const option of [
+    "--http-proxy=false",
+    "--unsetenv-all",
+    "--read-only",
+    "--read-only-tmpfs=false",
+  ]) {
+    assert.equal(args.includes(option), true, option);
+  }
+});
+
+test("host proxy credentials cannot enter the fixed environment allowlist", () => {
+  const fakeHostEnvironment = {
+    HTTP_PROXY: "http://proxy-user:proxy-password@proxy.invalid:8080",
+    HTTPS_PROXY: "http://tls-user:tls-password@proxy.invalid:8443",
+    NO_PROXY: "credential-marker.invalid",
+  } as const;
+  const previous = Object.fromEntries(
+    Object.keys(fakeHostEnvironment).map((key) => [key, process.env[key]]),
+  );
+
+  try {
+    Object.assign(process.env, fakeHostEnvironment);
+    const args = buildSandboxArgs(image, "patched");
+    const environment: string[] = [];
+
+    for (let index = 0; index < args.length; index += 1) {
+      if (args[index] === "--env") environment.push(args[index + 1]!);
+    }
+
+    assert.deepEqual(environment, [
+      "TARGET_MODE=patched",
+      "HOME=/tmp",
+      "NODE_ENV=production",
+      "PATH=/usr/local/bin:/usr/bin:/bin",
+    ]);
+    assert.equal(args.includes("--http-proxy=false"), true);
+    assert.equal(args.includes("--unsetenv-all"), true);
+    assert.equal(args.includes("--env-host"), false);
+
+    const joined = args.join("\n");
+    for (const [key, value] of Object.entries(fakeHostEnvironment)) {
+      assert.equal(joined.includes(key), false, key);
+      assert.equal(joined.includes(value), false, value);
+    }
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("policy source does not read the host environment or embed proxy credentials", () => {
+  const source = readFileSync(
+    new URL("../src/sandbox-policy.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(source, /process\.env/);
+  assert.equal(source.includes("--env-host"), false);
+  assert.equal(source.includes("--http-proxy=true"), false);
+  for (const credential of [
+    "proxy-user:proxy-password",
+    "tls-user:tls-password",
+    "credential-marker.invalid",
+  ]) {
+    assert.equal(source.includes(credential), false, credential);
+  }
+});
+
+test("image references reject transports and malformed digests", () => {
+  const invalidImages = [
+    "docker://docker.io/library/node:24-alpine",
+    "containers-storage:store",
+    "containers-storage:localhost/trustgate-target:test",
+    "dir:layout",
+    "dir:/tmp/oci-layout",
+    "oci:layout",
+    "oci:/tmp/oci-layout",
+    "docker-archive:image",
+    "docker-archive:/tmp/image.tar",
+    "oci-archive:image",
+    "oci-archive:/tmp/image.tar",
+    "image::tag",
+    "localhost:5000/repository::tag",
+    "image@sha256:xyz",
+    `image@sha256:${"a".repeat(63)}`,
+    `image@sha256:${"a".repeat(65)}`,
+    `image@sha512:${"b".repeat(127)}`,
+    `image@sha512:${"b".repeat(129)}`,
+    `image@sha384:${"c".repeat(96)}`,
+    `image@sha256:${"d".repeat(64)}@sha256:${"e".repeat(64)}`,
+  ];
+
+  for (const invalidImage of invalidImages) {
+    assert.throws(
+      () => buildSandboxArgs(invalidImage, "vulnerable"),
+      TypeError,
+      invalidImage,
+    );
+  }
+});
+
+test("valid sha256 and sha512 digest image references are accepted", () => {
+  const validImages = [
+    `localhost/trustgate-target@sha256:${"a".repeat(64)}`,
+    `registry.example.invalid:5000/team/target:v1@sha256:${"b".repeat(64)}`,
+    `docker.io/library/node@sha512:${"c".repeat(128)}`,
+  ];
+
+  for (const validImage of validImages) {
+    assert.equal(buildSandboxArgs(validImage, "patched").at(-1), validImage);
+  }
 });

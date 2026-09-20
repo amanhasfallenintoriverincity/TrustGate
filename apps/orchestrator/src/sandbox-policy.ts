@@ -1,6 +1,7 @@
 export type SandboxMode = "vulnerable" | "patched";
 
-export const SANDBOX_IMAGE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$/;
+export const SANDBOX_IMAGE_PATTERN =
+  /^(?=.{1,255}$)(?!(?:containers-storage|dir|oci|docker-archive|oci-archive):)(?!.*::)(?!.*:\/\/)[A-Za-z0-9][A-Za-z0-9._+-]*(?::[0-9]+)?(?:\/[A-Za-z0-9][A-Za-z0-9._+-]*)*(?::[A-Za-z0-9_][A-Za-z0-9._-]*)?(?:@(sha256:[A-Fa-f0-9]{64}|sha512:[A-Fa-f0-9]{128}))?$/;
 export const SANDBOX_NAME_SUFFIX_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 const assertImage: (image: unknown) => asserts image is string = (image) => {
@@ -47,9 +48,24 @@ export const buildSandboxArgs = (
     "--rm",
     "--name",
     name,
+    "--pull",
+    "never",
+    "--http-proxy=false",
+    "--unsetenv-all",
     "--network",
     "none",
+    "--pid",
+    "private",
+    "--ipc",
+    "private",
+    "--uts",
+    "private",
+    "--cgroupns",
+    "private",
     "--read-only",
+    "--read-only-tmpfs=false",
+    "--image-volume",
+    "ignore",
     "--tmpfs",
     "/tmp:rw,noexec,nosuid,nodev,size=16m",
     "--cap-drop",
@@ -70,6 +86,8 @@ export const buildSandboxArgs = (
     "HOME=/tmp",
     "--env",
     "NODE_ENV=production",
+    "--env",
+    "PATH=/usr/local/bin:/usr/bin:/bin",
     "--workdir",
     "/app",
     image,

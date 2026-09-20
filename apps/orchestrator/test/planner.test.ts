@@ -429,6 +429,195 @@ test("planner grounds evidence across multiple standard hunks", async () => {
   assert.equal(fake.calls.length, 1);
 });
 
+test("planner rejects a forged forward hunk offset after one generate call", async () => {
+  const input = makeInput();
+  input.diffs[0]!.diff = [
+    "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+    "--- a/src/routes/purchase.ts",
+    "+++ b/src/routes/purchase.ts",
+    "@@ -1 +1 @@",
+    "-old first",
+    "+new first",
+    "@@ -10 +1000 @@",
+    "-old later",
+    "+fabricated at line 1000",
+  ].join("\n");
+
+  await assertEvidenceRejected(
+    input,
+    {
+      file: "src/routes/purchase.ts",
+      line: 1000,
+      excerpt: "fabricated at line 1000",
+    },
+    /invalid diff/i,
+  );
+});
+
+test("planner rejects hunk offsets that contradict cumulative count deltas", async (t) => {
+  const cases = [
+    {
+      name: "prior insertion delta",
+      hunks: [
+        "@@ -1,0 +2,2 @@",
+        "+inserted one",
+        "+inserted two",
+        "@@ -10 +13 @@",
+        "-old later",
+        "+fabricated after insertion",
+      ],
+      line: 13,
+      excerpt: "fabricated after insertion",
+    },
+    {
+      name: "prior deletion delta",
+      hunks: [
+        "@@ -2,2 +1,0 @@",
+        "-deleted one",
+        "-deleted two",
+        "@@ -10 +7 @@",
+        "-old later",
+        "+fabricated after deletion",
+      ],
+      line: 7,
+      excerpt: "fabricated after deletion",
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const input = makeInput();
+      input.diffs[0]!.diff = [
+        "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+        "--- a/src/routes/purchase.ts",
+        "+++ b/src/routes/purchase.ts",
+        ...fixture.hunks,
+      ].join("\n");
+
+      await assertEvidenceRejected(
+        input,
+        {
+          file: "src/routes/purchase.ts",
+          line: fixture.line,
+          excerpt: fixture.excerpt,
+        },
+        /invalid diff/i,
+      );
+    });
+  }
+});
+
+test("planner validates a truncated final hunk header against prior offsets", async () => {
+  const input = makeInput();
+  input.diffs[0]!.diff = [
+    "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+    "--- a/src/routes/purchase.ts",
+    "+++ b/src/routes/purchase.ts",
+    "@@ -1 +1 @@",
+    "-old first",
+    "+grounded first",
+    "@@ -10 +1000 @@",
+    "",
+  ].join("\n");
+  input.diffs[0]!.truncated = true;
+
+  await assertEvidenceRejected(
+    input,
+    {
+      file: "src/routes/purchase.ts",
+      line: 1,
+      excerpt: "grounded first",
+    },
+    /invalid diff/i,
+  );
+});
+
+test("planner accepts Git multi-hunk diffs with unequal counts", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-planner-hunks-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  const path = "multi-hunk.txt";
+  const before = Array.from({ length: 30 }, (_, index) => `line-${index + 1}`);
+  await writeFile(join(repo, path), `${before.join("\n")}\n`);
+  const options = { cwd: repo, preferLocal: false } as const;
+  await execa("git", ["add", "--", path], options);
+  await execa("git", ["commit", "--quiet", "-m", "initial"], options);
+  const after = [
+    ...before.slice(0, 2),
+    "first added a",
+    "first added b",
+    ...before.slice(3, 14),
+    "second added",
+    ...before.slice(16),
+  ];
+  await writeFile(join(repo, path), `${after.join("\n")}\n`);
+  const diff = await runGitDiffProcess(repo, path);
+  assert.match(diff, /@@ -1,6 \+1,7 @@/);
+  assert.match(diff, /@@ -12,8 \+13,7 @@/);
+  const fake = fakeClient(
+    planWithEvidence([
+      { file: path, line: 4, excerpt: "first added b" },
+      { file: path, line: 16, excerpt: "second added" },
+      { file: path, line: 16, excerpt: "line-16" },
+    ]),
+  );
+
+  const result = await createSecurityPlanner(fake.client).plan(
+    inputForDiffs([{ path, diff, truncated: false }]),
+  );
+
+  assert.equal(result.hypotheses[0]?.evidence.length, 3);
+  assert.equal(fake.calls.length, 1);
+});
+
+test("planner accepts a Git zero-count insertion and deletion hunk series", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-planner-zero-hunks-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  const path = "zero-hunks.txt";
+  const before = Array.from({ length: 30 }, (_, index) => `line-${index + 1}`);
+  await writeFile(join(repo, path), `${before.join("\n")}\n`);
+  const options = { cwd: repo, preferLocal: false } as const;
+  await execa("git", ["add", "--", path], options);
+  await execa("git", ["commit", "--quiet", "-m", "initial"], options);
+  const after = [
+    ...before.slice(0, 3),
+    "inserted after three",
+    ...before.slice(3, 20),
+    ...before.slice(22),
+  ];
+  await writeFile(join(repo, path), `${after.join("\n")}\n`);
+  const { stdout: diff } = await execa(
+    "git",
+    [
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--no-color",
+      "--unified=0",
+      "--",
+      path,
+    ],
+    options,
+  );
+  assert.match(diff, /@@ -3,0 \+4 @@/);
+  assert.match(diff, /@@ -21,2 \+21,0 @@/);
+  const fake = fakeClient(
+    planWithEvidence([
+      { file: path, line: 4, excerpt: "inserted after three" },
+      { file: path, line: 22, excerpt: "line-22" },
+    ]),
+  );
+
+  const result = await createSecurityPlanner(fake.client).plan(
+    inputForDiffs([{ path, diff, truncated: false }]),
+  );
+
+  assert.equal(result.hypotheses[0]?.evidence.length, 2);
+  assert.equal(fake.calls.length, 1);
+});
+
 test("planner rejects lines beyond declared hunk counts", async () => {
   const input = makeInput();
   input.diffs[0]!.diff = [
@@ -932,6 +1121,111 @@ test("planner rejects arbitrary file-header suffixes without a tab", async (t) =
       await assertEvidenceRejected(
         input,
         { file: "src/routes/purchase.ts", line: 1, excerpt: "fabricated" },
+        /invalid diff/i,
+      );
+    });
+  }
+});
+
+test("planner recognizes actual quoted binary markers for Git-special filenames", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-planner-binary-paths-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  const paths = [
+    "space binary.bin",
+    `control-${String.fromCharCode(0x07)}.bin`,
+    "tab-\t.bin",
+    "newline-\n.bin",
+    "backslash-\\.bin",
+    "한글.bin",
+  ];
+
+  for (const path of paths) {
+    const absolutePath = join(repo, path);
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, Buffer.from([0, 1, 2]));
+  }
+  const options = { cwd: repo, preferLocal: false } as const;
+  await execa("git", ["add", "--", ...paths], options);
+  await execa("git", ["commit", "--quiet", "-m", "initial"], options);
+
+  const diffs = await Promise.all(
+    paths.map(async (path, index) => {
+      await writeFile(join(repo, path), Buffer.from([0, index + 3, 255]));
+      const diff = await runGitDiffProcess(repo, path);
+      assert.match(diff, /Binary files .+ and .+ differ/);
+      return { path, diff, truncated: false };
+    }),
+  );
+  const markerFor = (path: string): string =>
+    diffs
+      .find((fileDiff) => fileDiff.path === path)!
+      .diff.split("\n")
+      .find((line) => line.startsWith("Binary files "))!;
+  assert.equal(
+    markerFor("space binary.bin"),
+    "Binary files a/space binary.bin and b/space binary.bin differ",
+  );
+  for (const path of paths.slice(1)) {
+    assert.match(markerFor(path), /^Binary files \"/);
+  }
+
+  for (const fileDiff of diffs) {
+    await t.test(`cited ${JSON.stringify(fileDiff.path)}`, async () => {
+      await assertEvidenceRejected(
+        inputForDiffs(diffs),
+        { file: fileDiff.path, line: 1, excerpt: "Binary files" },
+        /ungrounded evidence[^]*not a changed line/i,
+      );
+    });
+
+    await t.test(`uncited ${JSON.stringify(fileDiff.path)}`, async () => {
+      const primary = makeInput().diffs[0]!;
+      const fake = fakeClient();
+      const result = await createSecurityPlanner(fake.client).plan(
+        inputForDiffs([primary, fileDiff]),
+      );
+      assert.equal(result.hypotheses[0]?.evidence[0]?.file, primary.path);
+      assert.equal(fake.calls.length, 1);
+    });
+  }
+});
+
+test("planner rejects malformed quoted binary markers", async (t) => {
+  const cases = [
+    {
+      name: "unknown escape",
+      marker:
+        'Binary files "a/src/routes/purchase\\q.ts" and "b/src/routes/purchase\\q.ts" differ',
+    },
+    {
+      name: "trailing data",
+      marker:
+        'Binary files "a/src/routes/purchase.ts" and "b/src/routes/purchase.ts" differ extra',
+    },
+    {
+      name: "path mismatch",
+      marker:
+        'Binary files "a/src/routes/other.ts" and "b/src/routes/other.ts" differ',
+    },
+    {
+      name: "mixed raw and quoted tokens",
+      marker:
+        'Binary files "a/src/routes/purchase.ts" and b/src/routes/purchase.ts differ',
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const input = makeInput();
+      input.diffs[0]!.diff = [
+        "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+        "index 1111111..2222222 100644",
+        fixture.marker,
+      ].join("\n");
+      await assertEvidenceRejected(
+        input,
+        { file: "src/routes/purchase.ts", line: 1, excerpt: "Binary files" },
         /invalid diff/i,
       );
     });

@@ -216,24 +216,40 @@ const metadataKind = (line: string): DiffKind | null | undefined => {
   return undefined;
 };
 
-const binaryMarkerMatches = (line: string, path: string): boolean =>
-  line === `Binary files a/${path} and b/${path} differ`;
+const binaryMarkerMatches = (line: string, path: string): boolean => {
+  const expectedOld = `a/${path}`;
+  const expectedNew = `b/${path}`;
+  if (line === `Binary files ${expectedOld} and ${expectedNew} differ`) {
+    return true;
+  }
+
+  const prefix = "Binary files ";
+  if (!line.startsWith(`${prefix}\"`)) return false;
+  const source = line.slice(prefix.length);
+  const oldToken = readGitToken(source, 0);
+  if (oldToken === null || source.slice(oldToken.next, oldToken.next + 5) !== " and ") {
+    return false;
+  }
+  const newOffset = oldToken.next + 5;
+  if (source[newOffset] !== '"') return false;
+  const newToken = readGitToken(source, newOffset);
+  return (
+    newToken !== null &&
+    source.slice(newToken.next) === " differ" &&
+    oldToken.value === expectedOld &&
+    newToken.value === expectedNew
+  );
+};
 
 const validateHunkRange = (
   path: string,
   current: CompletedHunk,
   previous: CompletedHunk | undefined,
+  cumulativeDelta: number,
 ): void => {
   const { oldStart, oldCount, newStart, newCount } = current;
   if ((oldCount > 0 && oldStart === 0) || (newCount > 0 && newStart === 0)) {
     return invalidDiff(path, "positive-count hunk ranges must start above zero");
-  }
-  if (
-    previous === undefined &&
-    ((oldCount === 0 && newCount > 0 && oldStart + 1 !== newStart) ||
-      (newCount === 0 && oldCount > 0 && newStart + 1 !== oldStart))
-  ) {
-    return invalidDiff(path, "zero-count hunk range is not Git-canonical");
   }
   if (
     previous !== undefined &&
@@ -241,6 +257,11 @@ const validateHunkRange = (
       newStart < previous.newStart + previous.newCount)
   ) {
     return invalidDiff(path, "hunk ranges overlap or go backwards");
+  }
+  const oldEffectiveStart = oldStart + (oldCount === 0 ? 1 : 0);
+  const newEffectiveStart = newStart + (newCount === 0 ? 1 : 0);
+  if (newEffectiveStart - oldEffectiveStart !== cumulativeDelta) {
+    return invalidDiff(path, "hunk range contradicts cumulative line offset");
   }
 };
 
@@ -276,6 +297,7 @@ const collectChangedLines = ({
   let declaredKind: DeclaredDiffKind = "unspecified";
   let hunk: HunkState | undefined;
   let previousHunk: CompletedHunk | undefined;
+  let cumulativeDelta = 0;
   let sawHunk = false;
   let nonTextual = false;
 
@@ -436,8 +458,9 @@ const collectChangedLines = ({
       newStart: newLine,
       newCount: newRemaining,
     };
-    validateHunkRange(path, currentHunk, previousHunk);
+    validateHunkRange(path, currentHunk, previousHunk, cumulativeDelta);
     previousHunk = currentHunk;
+    cumulativeDelta += newRemaining - oldRemaining;
     if (declaredKind === "add" && oldRemaining !== 0) {
       return invalidDiff(path, "added-file hunk must not consume old lines");
     }

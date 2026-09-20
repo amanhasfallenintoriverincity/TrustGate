@@ -56,7 +56,7 @@ export type SandboxCommandOptions = {
   env: Readonly<Record<string, string>>;
   extendEnv: false;
   input: string;
-  timeout: 30_000;
+  timeout: number;
   reject: true;
   preferLocal: false;
   shell: false;
@@ -65,17 +65,56 @@ export type SandboxCommandOptions = {
   maxBuffer: { stdout: 1_048_576; stderr: 8_192 };
 };
 
+export type SandboxCleanupOutput = {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+};
+
+export type SandboxCleanupOptions = {
+  cwd: "/";
+  env: Readonly<Record<string, string>>;
+  extendEnv: false;
+  timeout: 5_000;
+  reject: false;
+  preferLocal: false;
+  shell: false;
+  encoding: "utf8";
+  stripFinalNewline: false;
+  maxBuffer: { stdout: 8_192; stderr: 8_192 };
+};
+
+export type SandboxCleanupExecutor = (
+  file: string,
+  args: readonly string[],
+  options: SandboxCleanupOptions,
+) => Promise<SandboxCleanupOutput>;
+
 export type SandboxRunnerOptions = {
   image: string;
   hostRuntime: SandboxHostRuntime;
   runProcess?: RunSandboxProcess;
   podmanExecutable?: string;
+  cleanupExecutor?: SandboxCleanupExecutor;
+  processTimeoutMs?: number;
 };
 
 type ExpectedIdentity = { runId: string; hypothesisId: string };
 
 const genericPlanError = (): Error => new Error(PLAN_ERROR_MESSAGE);
 const genericExecutionError = (): Error => new Error(EXECUTION_ERROR_MESSAGE);
+
+const assertProcessTimeout = (value: unknown): number => {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > PODMAN_TIMEOUT_MS
+  ) {
+    throw genericExecutionError();
+  }
+  return value;
+};
 
 const assertTrustedExecutable: (value: unknown) => asserts value is string = (
   value,
@@ -165,20 +204,50 @@ const defaultCommandExecutor: SandboxCommandExecutor = async (
   return { stdout: String(result.stdout), stderr: String(result.stderr) };
 };
 
+const defaultCleanupExecutor: SandboxCleanupExecutor = async (
+  file,
+  args,
+  options,
+) => {
+  const result = await execa(file, args, options);
+  return {
+    stdout: String(result.stdout),
+    stderr: String(result.stderr),
+    exitCode: result.exitCode ?? -1,
+  };
+};
+
+const cleanupOptions = (
+  env: SandboxProcessPolicy["env"],
+): SandboxCleanupOptions => ({
+  cwd: "/",
+  env,
+  extendEnv: false,
+  timeout: 5_000,
+  reject: false,
+  preferLocal: false,
+  shell: false,
+  encoding: "utf8",
+  stripFinalNewline: false,
+  maxBuffer: { stdout: STDERR_MAX_BYTES, stderr: STDERR_MAX_BYTES },
+});
+
 export const runPodmanSandboxProcess = async (
   policy: SandboxProcessPolicy,
   stdin: string,
   podmanExecutable = DEFAULT_PODMAN_EXECUTABLE,
   execute: SandboxCommandExecutor = defaultCommandExecutor,
+  timeoutMs = PODMAN_TIMEOUT_MS,
 ): Promise<SandboxProcessOutput> => {
   try {
     assertTrustedExecutable(podmanExecutable);
+    const timeout = assertProcessTimeout(timeoutMs);
     return await execute(podmanExecutable, policy.args, {
       cwd: "/",
       env: policy.env,
       extendEnv: false,
       input: stdin,
-      timeout: PODMAN_TIMEOUT_MS,
+      timeout,
       reject: true,
       preferLocal: false,
       shell: false,
@@ -250,12 +319,68 @@ const createPrivateConfig = async (
 
 const uniqueSuffix = (): string => randomBytes(12).toString("hex");
 
+const containerNameFromPolicy = (policy: SandboxProcessPolicy): string => {
+  const nameIndexes = policy.args.flatMap((argument, index) =>
+    argument === "--name" ? [index] : [],
+  );
+  if (nameIndexes.length !== 1) throw genericExecutionError();
+
+  const containerName = policy.args[nameIndexes[0]! + 1];
+  if (
+    containerName === undefined ||
+    !/^trustgate-target-(?:vulnerable|patched)-[a-f0-9]{24}$/.test(
+      containerName,
+    )
+  ) {
+    throw genericExecutionError();
+  }
+  return containerName;
+};
+
+export const removePodmanSandboxContainer = async (
+  policy: SandboxProcessPolicy,
+  podmanExecutable = DEFAULT_PODMAN_EXECUTABLE,
+  execute: SandboxCleanupExecutor = defaultCleanupExecutor,
+): Promise<boolean> => {
+  try {
+    assertTrustedExecutable(podmanExecutable);
+    const containerName = containerNameFromPolicy(policy);
+    const options = cleanupOptions(policy.env);
+    try {
+      await execute(
+        podmanExecutable,
+        ["rm", "--force", "--ignore", "--time", "0", containerName],
+        options,
+      );
+    } catch {
+      // Verification below is authoritative: a timed-out client can lose the
+      // successful removal result, while a failed removal may leave the name.
+    }
+    const existsResult = await execute(
+      podmanExecutable,
+      ["container", "exists", containerName],
+      options,
+    );
+    return existsResult.exitCode === 1;
+  } catch {
+    return false;
+  }
+};
+
 export const createSandboxRunner = (options: SandboxRunnerOptions) => {
   const podmanExecutable = options.podmanExecutable ?? DEFAULT_PODMAN_EXECUTABLE;
+  const processTimeoutMs = options.processTimeoutMs ?? PODMAN_TIMEOUT_MS;
   const runProcess: RunSandboxProcess =
     options.runProcess ??
     ((policy, stdin) =>
-      runPodmanSandboxProcess(policy, stdin, podmanExecutable));
+      runPodmanSandboxProcess(
+        policy,
+        stdin,
+        podmanExecutable,
+        defaultCommandExecutor,
+        processTimeoutMs,
+      ));
+  const cleanupExecutor = options.cleanupExecutor ?? defaultCleanupExecutor;
 
   return {
     async run(mode: SandboxMode, inputPlan: AnalysisPlan): Promise<ExecutionResult[]> {
@@ -264,44 +389,60 @@ export const createSandboxRunner = (options: SandboxRunnerOptions) => {
       let privateConfig:
         | { directory: string; path: string; suffix: string }
         | undefined;
+      let policy: SandboxProcessPolicy | undefined;
+      let launched = false;
+      let result: ExecutionResult[] | undefined;
+      let failed = false;
 
       try {
-        if (options.runProcess === undefined) {
-          assertTrustedExecutable(podmanExecutable);
-        }
+        assertTrustedExecutable(podmanExecutable);
+        assertProcessTimeout(processTimeoutMs);
         const suffix = uniqueSuffix();
         const configPath = join(
           options.hostRuntime.xdgRuntimeDir,
           `${CONFIG_DIRECTORY_PREFIX}${suffix}`,
           CONFIG_FILENAME,
         );
-        const policy = buildSandboxProcessPolicy(
+        policy = buildSandboxProcessPolicy(
           options.image,
           mode,
           configPath,
           options.hostRuntime,
           suffix,
         );
+        containerNameFromPolicy(policy);
         privateConfig = await createPrivateConfig(
           options.hostRuntime.xdgRuntimeDir,
           policy.containersConf,
           suffix,
         );
         if (privateConfig.path !== configPath) throw genericExecutionError();
+        launched = true;
         const output = await runProcess(policy, stdin);
         if (output.stderr !== "") throw genericExecutionError();
-        return validateResults(output.stdout, expected);
+        result = validateResults(output.stdout, expected);
       } catch {
-        throw genericExecutionError();
+        failed = true;
       } finally {
+        if (launched && policy !== undefined) {
+          const containerAbsent = await removePodmanSandboxContainer(
+            policy,
+            podmanExecutable,
+            cleanupExecutor,
+          );
+          if (!containerAbsent) failed = true;
+        }
         if (privateConfig !== undefined) {
           try {
             await rm(privateConfig.directory, { recursive: true, force: true });
           } catch {
-            throw genericExecutionError();
+            failed = true;
           }
         }
       }
+
+      if (failed || result === undefined) throw genericExecutionError();
+      return result;
     },
   };
 };

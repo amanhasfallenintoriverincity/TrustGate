@@ -12,13 +12,32 @@ import {
 
 import {
   createSandboxRunner,
+  removePodmanSandboxContainer,
   runPodmanSandboxProcess,
+  type SandboxCleanupExecutor,
   type SandboxCommandExecutor,
   type RunSandboxProcess,
 } from "../src/sandbox-runner.js";
-import { SANDBOX_CONTAINERS_CONF } from "../src/sandbox-policy.js";
+import {
+  SANDBOX_CONTAINERS_CONF,
+  type SandboxProcessPolicy,
+} from "../src/sandbox-policy.js";
 
 const image = "localhost/trustgate-target:sandbox";
+
+type TestRunnerOptions = Parameters<typeof createSandboxRunner>[0];
+
+const absentCleanupExecutor: SandboxCleanupExecutor = async (_file, args) => ({
+  stdout: "",
+  stderr: "",
+  exitCode: args[0] === "container" ? 1 : 0,
+});
+
+const createTestSandboxRunner = (options: TestRunnerOptions) =>
+  createSandboxRunner({
+    cleanupExecutor: absentCleanupExecutor,
+    ...options,
+  });
 
 const makePlan = (...testIds: string[]): AnalysisPlan => ({
   version: 1,
@@ -81,7 +100,7 @@ test("runner snapshots a validated plan and sends only normalized JSON", async (
   await withRuntime(async (hostRuntime) => {
     const plan = makePlan("negative-price");
     let observedInput = "";
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       runProcess: async (_policy, stdin) => {
@@ -105,7 +124,7 @@ test("runner snapshots a validated plan and sends only normalized JSON", async (
 test("invalid and oversized plans fail before process or filesystem side effects", async () => {
   await withRuntime(async (hostRuntime) => {
     let processCalls = 0;
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       runProcess: async () => {
@@ -135,7 +154,7 @@ test("invalid and oversized plans fail before process or filesystem side effects
 test("plan serialization errors are generic and do not call the process", async () => {
   await withRuntime(async (hostRuntime) => {
     let processCalls = 0;
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       runProcess: async () => {
@@ -166,7 +185,7 @@ test("invalid runtime and policy inputs fail before any filesystem write", async
       calls += 1;
       return { stdout: "[]", stderr: "" };
     };
-    const invalidImageRunner = createSandboxRunner({
+    const invalidImageRunner = createTestSandboxRunner({
       image: "-invalid-image",
       hostRuntime: { home: "/home/trustgate", xdgRuntimeDir: root },
       runProcess,
@@ -177,7 +196,7 @@ test("invalid runtime and policy inputs fail before any filesystem write", async
     );
 
     const missingRuntime = join(root, "missing");
-    const missingRuntimeRunner = createSandboxRunner({
+    const missingRuntimeRunner = createTestSandboxRunner({
       image,
       hostRuntime: { home: "/home/trustgate", xdgRuntimeDir: missingRuntime },
       runProcess,
@@ -195,7 +214,7 @@ test("invalid runtime and policy inputs fail before any filesystem write", async
 
 test("an invalid real Podman path is rejected before filesystem side effects", async () => {
   await withRuntime(async (hostRuntime) => {
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       podmanExecutable: "podman",
@@ -216,7 +235,7 @@ test("runner creates exact private config and cleans it after success", async ()
   await withRuntime(async (hostRuntime) => {
     let configPath = "";
     let tempDirectory = "";
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       runProcess: async (policy, stdin) => {
@@ -256,7 +275,7 @@ test("runner creates exact private config and cleans it after success", async ()
 test("runner cleans private config and hides process errors", async () => {
   await withRuntime(async (hostRuntime) => {
     let configPath = "";
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       runProcess: async (policy) => {
@@ -273,6 +292,305 @@ test("runner cleans private config and hides process errors", async () => {
   });
 });
 
+test("every launched runner path removes its exact policy container once", async () => {
+  await withRuntime(async (hostRuntime) => {
+    const cases: ReadonlyArray<{
+      label: string;
+      runProcess: RunSandboxProcess;
+      expectedMessage?: string;
+    }> = [
+      {
+        label: "success",
+        runProcess: async () => ({
+          stdout: JSON.stringify([makeResult("negative-price")]),
+          stderr: "",
+        }),
+      },
+      {
+        label: "malformed stdout",
+        runProcess: async () => ({ stdout: "not-json", stderr: "" }),
+        expectedMessage: "sandbox execution failed",
+      },
+      {
+        label: "stderr failure",
+        runProcess: async () => ({
+          stdout: JSON.stringify([makeResult("negative-price")]),
+          stderr: "raw-stderr-secret",
+        }),
+        expectedMessage: "sandbox execution failed",
+      },
+      {
+        label: "process rejection or timeout",
+        runProcess: async () => {
+          throw new Error("raw-timeout-secret");
+        },
+        expectedMessage: "sandbox execution failed",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const cleanupCalls: Array<{
+        file: string;
+        args: readonly string[];
+        options: Parameters<SandboxCleanupExecutor>[2];
+      }> = [];
+      let launchedPolicy: SandboxProcessPolicy | undefined;
+      const cleanupExecutor: SandboxCleanupExecutor = async (file, args, options) => {
+        cleanupCalls.push({ file, args, options });
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: args[0] === "container" ? 1 : 0,
+        };
+      };
+      const runner = createTestSandboxRunner({
+        image,
+        hostRuntime,
+        runProcess: async (policy, stdin) => {
+          launchedPolicy = policy;
+          return testCase.runProcess(policy, stdin);
+        },
+        cleanupExecutor,
+      });
+
+      if (testCase.expectedMessage === undefined) {
+        assert.deepEqual(
+          await runner.run("patched", makePlan("negative-price")),
+          [makeResult("negative-price")],
+          testCase.label,
+        );
+      } else {
+        assert.equal(
+          await rejectionMessage(runner.run("patched", makePlan("negative-price"))),
+          testCase.expectedMessage,
+          testCase.label,
+        );
+      }
+
+      assert.ok(launchedPolicy, testCase.label);
+      const nameIndex = launchedPolicy.args.indexOf("--name");
+      assert.notEqual(nameIndex, -1, testCase.label);
+      const containerName = launchedPolicy.args[nameIndex + 1];
+      assert.match(
+        containerName ?? "",
+        /^trustgate-target-patched-[a-f0-9]{24}$/,
+        testCase.label,
+      );
+      assert.equal(
+        launchedPolicy.args.filter((value) => value === "--name").length,
+        1,
+        testCase.label,
+      );
+      assert.equal(
+        cleanupCalls.filter((call) => call.args[0] === "rm").length,
+        1,
+        testCase.label,
+      );
+      assert.deepEqual(
+        cleanupCalls.map((call) => call.args),
+        [
+          ["rm", "--force", "--ignore", "--time", "0", containerName],
+          ["container", "exists", containerName],
+        ],
+        testCase.label,
+      );
+    }
+  });
+});
+
+test("cleanup rejects a policy whose container name is ambiguous or untrusted", async () => {
+  const env = {
+    CONTAINERS_CONF: "/run/user/1000/trustgate/containers.conf",
+    HOME: "/home/trustgate",
+    XDG_RUNTIME_DIR: "/run/user/1000",
+    PATH: "/usr/bin:/bin",
+  };
+  const policies: readonly SandboxProcessPolicy[] = [
+    {
+      args: [
+        "run",
+        "--name",
+        "trustgate-target-patched-deadbeefdeadbeefdeadbeef",
+        "--name",
+        "trustgate-target-patched-cafebabecafebabecafebabe",
+        image,
+      ],
+      env,
+      containersConf: SANDBOX_CONTAINERS_CONF,
+    },
+    {
+      args: ["run", "--name", "attacker-controlled", image],
+      env,
+      containersConf: SANDBOX_CONTAINERS_CONF,
+    },
+  ];
+
+  for (const policy of policies) {
+    let cleanupCalls = 0;
+    assert.equal(
+      await removePodmanSandboxContainer(
+        policy,
+        "/usr/bin/podman",
+        async () => {
+          cleanupCalls += 1;
+          return { stdout: "", stderr: "", exitCode: 1 };
+        },
+      ),
+      false,
+    );
+    assert.equal(cleanupCalls, 0);
+  }
+});
+
+test("cleanup uses the trusted Podman boundary and policy environment", async () => {
+  await withRuntime(async (hostRuntime) => {
+    const cleanupCalls: Array<{
+      file: string;
+      args: readonly string[];
+      options: Parameters<SandboxCleanupExecutor>[2];
+    }> = [];
+    let launchedPolicy: SandboxProcessPolicy | undefined;
+    const runner = createTestSandboxRunner({
+      image,
+      hostRuntime,
+      podmanExecutable: "/opt/trusted/bin/podman",
+      runProcess: async (policy) => {
+        launchedPolicy = policy;
+        return {
+          stdout: JSON.stringify([makeResult("negative-price")]),
+          stderr: "",
+        };
+      },
+      cleanupExecutor: async (file, args, options) => {
+        cleanupCalls.push({ file, args, options });
+        return {
+          stdout: args[0] === "container" ? "" : "raw-cleanup-stdout-secret",
+          stderr: args[0] === "container" ? "" : "raw-cleanup-stderr-secret",
+          exitCode: args[0] === "container" ? 1 : 0,
+        };
+      },
+    });
+
+    assert.deepEqual(await runner.run("vulnerable", makePlan("negative-price")), [
+      makeResult("negative-price"),
+    ]);
+    assert.ok(launchedPolicy);
+    assert.equal(cleanupCalls.length, 2);
+    for (const call of cleanupCalls) {
+      assert.equal(call.file, "/opt/trusted/bin/podman");
+      assert.deepEqual(call.options, {
+        cwd: "/",
+        env: launchedPolicy.env,
+        extendEnv: false,
+        timeout: 5_000,
+        reject: false,
+        preferLocal: false,
+        shell: false,
+        encoding: "utf8",
+        stripFinalNewline: false,
+        maxBuffer: { stdout: 8_192, stderr: 8_192 },
+      });
+    }
+  });
+});
+
+test("cleanup completes while the private config still exists", async () => {
+  await withRuntime(async (hostRuntime) => {
+    const events: string[] = [];
+    let configPath = "";
+    const cleanupExecutor: SandboxCleanupExecutor = async (_file, args, options) => {
+      events.push(args[0] ?? "");
+      assert.equal(existsSync(configPath), true);
+      assert.equal(readFileSync(configPath, "utf8"), SANDBOX_CONTAINERS_CONF);
+      assert.equal(
+        (options.env as Readonly<Record<string, string>>).CONTAINERS_CONF,
+        configPath,
+      );
+      return {
+        stdout: "",
+        stderr: "",
+        exitCode: args[0] === "container" ? 1 : 0,
+      };
+    };
+    const runner = createTestSandboxRunner({
+      image,
+      hostRuntime,
+      runProcess: async (policy) => {
+        events.push("run");
+        configPath = policy.env.CONTAINERS_CONF!;
+        return {
+          stdout: JSON.stringify([makeResult("negative-price")]),
+          stderr: "",
+        };
+      },
+      cleanupExecutor,
+    });
+
+    await runner.run("patched", makePlan("negative-price"));
+
+    events.push(existsSync(configPath) ? "config-present" : "config-deleted");
+    assert.deepEqual(events, ["run", "rm", "container", "config-deleted"]);
+  });
+});
+
+test("cleanup failure or a remaining container fails closed and still removes config", async () => {
+  await withRuntime(async (hostRuntime) => {
+    for (const scenario of [
+      "cleanup rejected but absent",
+      "cleanup rejected and existence unknown",
+      "container remains",
+    ] as const) {
+      let configPath = "";
+      const cleanupExecutor: SandboxCleanupExecutor = async (_file, args) => {
+        if (args[0] === "rm" && scenario !== "container remains") {
+          throw new Error("raw-cleanup-secret");
+        }
+        if (
+          args[0] === "container" &&
+          scenario === "cleanup rejected and existence unknown"
+        ) {
+          throw new Error("raw-exists-secret");
+        }
+        return {
+          stdout: scenario === "container remains" ? "raw-name-secret" : "",
+          stderr: scenario === "container remains" ? "raw-inspect-secret" : "",
+          exitCode: scenario === "container remains" ? 0 : 1,
+        };
+      };
+      const runner = createTestSandboxRunner({
+        image,
+        hostRuntime,
+        runProcess: async (policy) => {
+          configPath = policy.env.CONTAINERS_CONF!;
+          return {
+            stdout: JSON.stringify([makeResult("negative-price")]),
+            stderr: "",
+          };
+        },
+        cleanupExecutor,
+      });
+
+      if (scenario === "cleanup rejected but absent") {
+        assert.deepEqual(await runner.run("patched", makePlan("negative-price")), [
+          makeResult("negative-price"),
+        ]);
+      } else {
+        const message = await rejectionMessage(
+          runner.run("patched", makePlan("negative-price")),
+        );
+        assert.equal(message, "sandbox execution failed", scenario);
+        assert.doesNotMatch(
+          message,
+          /raw-cleanup|raw-exists|raw-name|raw-inspect/,
+          scenario,
+        );
+      }
+      assert.equal(existsSync(configPath), false, scenario);
+      assert.equal(existsSync(join(configPath, "..")), false, scenario);
+    }
+  });
+});
+
 test("each run uses a unique lowercase config path and container suffix", async () => {
   await withRuntime(async (hostRuntime) => {
     const paths: string[] = [];
@@ -282,7 +600,7 @@ test("each run uses a unique lowercase config path and container suffix", async 
       names.push(policy.args[policy.args.indexOf("--name") + 1]!);
       return { stdout: JSON.stringify([makeResult("negative-price")]), stderr: "" };
     };
-    const runner = createSandboxRunner({ image, hostRuntime, runProcess });
+    const runner = createTestSandboxRunner({ image, hostRuntime, runProcess });
 
     await runner.run("patched", makePlan("negative-price"));
     await runner.run("patched", makePlan("negative-price"));
@@ -307,7 +625,7 @@ test("malformed, oversized, and schema-invalid stdout fail closed", async () => 
       `${JSON.stringify([makeResult("negative-price")])}\nlog-line`,
     ]) {
       let calls = 0;
-      const runner = createSandboxRunner({
+      const runner = createTestSandboxRunner({
         image,
         hostRuntime,
         runProcess: async () => {
@@ -326,7 +644,7 @@ test("malformed, oversized, and schema-invalid stdout fail closed", async () => 
 test("any stderr content, including whitespace, is rejected without disclosure", async () => {
   await withRuntime(async (hostRuntime) => {
     for (const stderr of ["sensitive stderr marker", " \n\t", "\n", "\r\n"]) {
-      const runner = createSandboxRunner({
+      const runner = createTestSandboxRunner({
         image,
         hostRuntime,
         runProcess: async () => ({
@@ -357,7 +675,7 @@ test("output cardinality, order, uniqueness, and identity are exact", async () =
     ];
 
     for (const output of invalidOutputs) {
-      const runner = createSandboxRunner({
+      const runner = createTestSandboxRunner({
         image,
         hostRuntime,
         runProcess: async () => ({ stdout: JSON.stringify(output), stderr: "" }),
@@ -377,7 +695,7 @@ test("validated results are fresh values and the process is never retried", asyn
       stderr: "",
     };
     let calls = 0;
-    const runner = createSandboxRunner({
+    const runner = createTestSandboxRunner({
       image,
       hostRuntime,
       runProcess: async () => {
@@ -457,6 +775,33 @@ test("real execa preserves trailing LF and CRLF stderr", async () => {
     ),
     { stdout: "", stderr: "\r\n" },
   );
+});
+
+test("runner rejects invalid process timeout before filesystem side effects", async () => {
+  await withRuntime(async (hostRuntime) => {
+    for (const processTimeoutMs of [0, 30_001, 1.5, Number.NaN]) {
+      let processCalls = 0;
+      const runner = createTestSandboxRunner({
+        image,
+        hostRuntime,
+        processTimeoutMs,
+        runProcess: async () => {
+          processCalls += 1;
+          return { stdout: "[]", stderr: "" };
+        },
+      });
+
+      assert.equal(
+        await rejectionMessage(runner.run("patched", makePlan("negative-price"))),
+        "sandbox execution failed",
+      );
+      assert.equal(processCalls, 0);
+      assert.deepEqual(
+        await (await import("node:fs/promises")).readdir(hostRuntime.xdgRuntimeDir),
+        [],
+      );
+    }
+  });
 });
 
 test("Podman executor rejects untrusted paths and masks subprocess failures", async () => {

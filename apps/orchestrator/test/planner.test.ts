@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
+
+import { execa } from "execa";
 
 import type {
   LlmClient,
@@ -7,6 +12,7 @@ import type {
   LlmResponse,
 } from "@trustgate/llm-gateway";
 
+import { runGitDiffProcess } from "../src/diff-collector.js";
 import {
   createSecurityPlanner,
   PLANNER_INPUT_MAX_BYTES,
@@ -179,6 +185,25 @@ const assertEvidenceRejected = async (
   await assert.rejects(createSecurityPlanner(fake.client).plan(input), error);
   assert.equal(fake.calls.length, 1);
 };
+
+const initializeRepository = async (repo: string): Promise<void> => {
+  const options = { cwd: repo, preferLocal: false } as const;
+  await execa("git", ["init", "--quiet"], options);
+  await execa("git", ["config", "user.email", "test@example.com"], options);
+  await execa("git", ["config", "user.name", "Test User"], options);
+};
+
+const inputForDiffs = (diffs: PlannerInput["diffs"]): PlannerInput => ({
+  mode: "workspace",
+  files: diffs.map(({ path }) => ({
+    path,
+    status: "modified",
+    additions: 1,
+    deletions: 1,
+  })),
+  ruleGroups: [{ files: diffs.map(({ path }) => path), rules: "review changes" }],
+  diffs,
+});
 
 test("planner accepts a schema-valid plan", async () => {
   const input: PlannerInput = {
@@ -431,6 +456,17 @@ test("planner rejects malformed unified diff envelopes", async (t) => {
     {
       name: "bare hunk",
       diff: ["@@ -1 +1 @@", "-old", "+fabricated"].join("\n"),
+    },
+    {
+      name: "unquoted envelope with ambiguous path split",
+      diff: [
+        "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts extra",
+        "--- a/src/routes/purchase.ts",
+        "+++ b/src/routes/purchase.ts",
+        "@@ -1 +1 @@",
+        "-old",
+        "+fabricated",
+      ].join("\n"),
     },
     {
       name: "binary marker followed by injected hunk",
@@ -761,10 +797,10 @@ test("planner accepts zero-count and multiple complete hunks", async () => {
     "index 1111111..2222222 100644",
     "--- a/src/routes/purchase.ts",
     "+++ b/src/routes/purchase.ts",
-    "@@ -1,0 +1,2 @@",
+    "@@ -1,0 +2,2 @@",
     "+first added",
     "+second added",
-    "@@ -10,2 +12,0 @@",
+    "@@ -10,2 +11,0 @@",
     "-first deleted",
     "-second deleted",
   ].join("\n");
@@ -772,7 +808,7 @@ test("planner accepts zero-count and multiple complete hunks", async () => {
     planWithEvidence([
       {
         file: "src/routes/purchase.ts",
-        line: 2,
+        line: 3,
         excerpt: "second added",
       },
       {
@@ -788,7 +824,7 @@ test("planner accepts zero-count and multiple complete hunks", async () => {
   assert.equal(fake.calls.length, 1);
 });
 
-test("planner accepts only present lines from a truncated final hunk", async () => {
+test("planner accepts only complete present lines from a truncated final hunk", async () => {
   const input = makeInput();
   input.diffs[0]!.diff = [
     "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
@@ -797,6 +833,7 @@ test("planner accepts only present lines from a truncated final hunk", async () 
     "@@ -1,3 +1,3 @@",
     "-old first",
     "+present change",
+    "",
   ].join("\n");
   input.diffs[0]!.truncated = true;
   const fake = fakeClient(
@@ -866,6 +903,395 @@ test("planner rejects unknown Git path escapes", async () => {
   );
 });
 
+test("planner rejects arbitrary file-header suffixes without a tab", async (t) => {
+  const cases = [
+    {
+      name: "unquoted",
+      oldHeader: "--- a/src/routes/purchase.ts fake-metadata",
+      newHeader: "+++ b/src/routes/purchase.ts fake-metadata",
+    },
+    {
+      name: "quoted",
+      oldHeader: '--- "a/src/routes/purchase.ts" fake-metadata',
+      newHeader: '+++ "b/src/routes/purchase.ts" fake-metadata',
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const input = makeInput();
+      input.diffs[0]!.diff = [
+        "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+        fixture.oldHeader,
+        fixture.newHeader,
+        "@@ -1 +1 @@",
+        "-old",
+        "+fabricated",
+      ].join("\n");
+
+      await assertEvidenceRejected(
+        input,
+        { file: "src/routes/purchase.ts", line: 1, excerpt: "fabricated" },
+        /invalid diff/i,
+      );
+    });
+  }
+});
+
+test("planner accepts actual Task6 diffs for Git-special filenames", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-planner-paths-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await initializeRepository(repo);
+  const paths = [
+    "dir/a b.ts",
+    `bel-${String.fromCharCode(0x07)}.ts`,
+    `bs-${String.fromCharCode(0x08)}.ts`,
+    `ff-${String.fromCharCode(0x0c)}.ts`,
+    `vt-${String.fromCharCode(0x0b)}.ts`,
+    "tab-\t.ts",
+    "newline-\n.ts",
+    "backslash-\\.ts",
+    "한글.ts",
+  ];
+
+  for (const path of paths) {
+    const absolutePath = join(repo, path);
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, "before\n");
+  }
+  const options = { cwd: repo, preferLocal: false } as const;
+  await execa("git", ["add", "--", ...paths], options);
+  await execa("git", ["commit", "--quiet", "-m", "initial"], options);
+
+  const diffs = await Promise.all(
+    paths.map(async (path, index) => {
+      await writeFile(join(repo, path), `grounded-after-${index}\n`);
+      return { path, diff: await runGitDiffProcess(repo, path), truncated: false };
+    }),
+  );
+
+  for (const [index, fileDiff] of diffs.entries()) {
+    await t.test(JSON.stringify(fileDiff.path), async () => {
+      const fake = fakeClient(
+        planWithEvidence([
+          {
+            file: fileDiff.path,
+            line: 1,
+            excerpt: `grounded-after-${index}`,
+          },
+        ]),
+      );
+      const result = await createSecurityPlanner(fake.client).plan(
+        inputForDiffs(diffs),
+      );
+      assert.equal(result.hypotheses[0]?.evidence[0]?.file, fileDiff.path);
+      assert.equal(fake.calls.length, 1);
+    });
+  }
+});
+
+test("planner parses only cited diffs and ignores non-textual companions", async (t) => {
+  const primary = makeInput().diffs[0]!;
+  const companions = [
+    {
+      name: "malformed textual diff",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "--- a/companion.ts",
+        "+++ b/companion.ts",
+        "@@ -1,2 +1,2 @@",
+        "-old",
+        "+malformed companion",
+      ].join("\n"),
+      truncated: false,
+    },
+    {
+      name: "mode-only",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "old mode 100644",
+        "new mode 100755",
+      ].join("\n"),
+      truncated: false,
+    },
+    {
+      name: "binary",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "index 1111111..2222222 100644",
+        "Binary files a/companion.ts and b/companion.ts differ",
+      ].join("\n"),
+      truncated: false,
+    },
+    {
+      name: "empty addition",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "new file mode 100644",
+        "index 0000000..e69de29",
+      ].join("\n"),
+      truncated: false,
+    },
+    { name: "budget exhausted", diff: "", truncated: true },
+  ];
+
+  for (const companion of companions) {
+    await t.test(companion.name, async () => {
+      const input = inputForDiffs([
+        primary,
+        {
+          path: "companion.ts",
+          diff: companion.diff,
+          truncated: companion.truncated,
+        },
+      ]);
+      const fake = fakeClient();
+      const result = await createSecurityPlanner(fake.client).plan(input);
+      assert.equal(result.hypotheses[0]?.evidence[0]?.file, primary.path);
+      assert.equal(fake.calls.length, 1);
+    });
+  }
+});
+
+test("planner rejects evidence that cites a no-text companion diff", async (t) => {
+  const companions = [
+    {
+      name: "malformed textual diff",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "--- a/companion.ts",
+        "+++ b/companion.ts",
+        "@@ -1,2 +1,2 @@",
+        "-old",
+        "+fabricated",
+      ].join("\n"),
+      truncated: false,
+      error: /invalid diff/i,
+    },
+    {
+      name: "mode-only",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "old mode 100644",
+        "new mode 100755",
+      ].join("\n"),
+      truncated: false,
+    },
+    {
+      name: "binary",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "index 1111111..2222222 100644",
+        "Binary files a/companion.ts and b/companion.ts differ",
+      ].join("\n"),
+      truncated: false,
+    },
+    {
+      name: "empty addition",
+      diff: [
+        "diff --git a/companion.ts b/companion.ts",
+        "new file mode 100644",
+        "index 0000000..e69de29",
+      ].join("\n"),
+      truncated: false,
+    },
+    { name: "budget exhausted", diff: "", truncated: true },
+  ];
+
+  for (const companion of companions) {
+    await t.test(companion.name, async () => {
+      const input = inputForDiffs([
+        makeInput().diffs[0]!,
+        {
+          path: "companion.ts",
+          diff: companion.diff,
+          truncated: companion.truncated,
+        },
+      ]);
+      await assertEvidenceRejected(
+        input,
+        { file: "companion.ts", line: 1, excerpt: "metadata" },
+        "error" in companion
+          ? companion.error
+          : /ungrounded evidence.*not a changed line/i,
+      );
+    });
+  }
+});
+
+test("planner discards a truncated final physical line without a newline", async () => {
+  const input = makeInput();
+  input.diffs[0]!.diff = [
+    "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+    "--- a/src/routes/purchase.ts",
+    "+++ b/src/routes/purchase.ts",
+    "@@ -1 +1 @@",
+    "-old value",
+    "+incomplete evidence bytes",
+  ].join("\n");
+  input.diffs[0]!.truncated = true;
+
+  await assertEvidenceRejected(
+    input,
+    {
+      file: "src/routes/purchase.ts",
+      line: 1,
+      excerpt: "incomplete evidence bytes",
+    },
+    /ungrounded evidence.*(?:not a changed line|excerpt is not present)/i,
+  );
+});
+
+test("planner retains a complete changed line before truncated EOF", async () => {
+  const input = makeInput();
+  input.diffs[0]!.diff = [
+    "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+    "--- a/src/routes/purchase.ts",
+    "+++ b/src/routes/purchase.ts",
+    "@@ -1,2 +1,2 @@",
+    "-old value",
+    "+complete evidence line",
+    "",
+  ].join("\n");
+  input.diffs[0]!.truncated = true;
+  const fake = fakeClient(
+    planWithEvidence([
+      {
+        file: "src/routes/purchase.ts",
+        line: 1,
+        excerpt: "complete evidence line",
+      },
+    ]),
+  );
+
+  const result = await createSecurityPlanner(fake.client).plan(input);
+  assert.equal(result.hypotheses[0]?.evidence[0]?.excerpt, "complete evidence line");
+  assert.equal(fake.calls.length, 1);
+});
+
+test("planner rejects noncanonical or nonmonotonic hunk ranges", async (t) => {
+  const cases = [
+    {
+      name: "old start zero with positive count",
+      hunks: ["@@ -0,1 +1 @@", "-old", "+fabricated"],
+    },
+    {
+      name: "new start zero with positive count",
+      hunks: ["@@ -1 +0,1 @@", "-old", "+fabricated"],
+    },
+    {
+      name: "zero-count old start does not precede new start",
+      hunks: ["@@ -4,0 +4 @@", "+fabricated"],
+    },
+    {
+      name: "zero-count new start does not precede old start",
+      hunks: ["@@ -4 +4,0 @@", "-fabricated"],
+    },
+    {
+      name: "old ranges overlap",
+      hunks: [
+        "@@ -5,2 +5,2 @@",
+        "-old one",
+        "-old two",
+        "+new one",
+        "+new two",
+        "@@ -6 +20 @@",
+        "-later old",
+        "+fabricated",
+      ],
+    },
+    {
+      name: "new ranges overlap",
+      hunks: [
+        "@@ -5,2 +5,2 @@",
+        "-old one",
+        "-old two",
+        "+new one",
+        "+new two",
+        "@@ -20 +6 @@",
+        "-later old",
+        "+fabricated",
+      ],
+    },
+    {
+      name: "old ranges go backwards after zero-count insertion",
+      hunks: [
+        "@@ -8,0 +9 @@",
+        "+first",
+        "@@ -7 +20 @@",
+        "-old",
+        "+fabricated",
+      ],
+    },
+    {
+      name: "new ranges go backwards after zero-count deletion",
+      hunks: [
+        "@@ -9 +8,0 @@",
+        "-first",
+        "@@ -20 +7 @@",
+        "-old",
+        "+fabricated",
+      ],
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async () => {
+      const input = makeInput();
+      input.diffs[0]!.diff = [
+        "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+        "--- a/src/routes/purchase.ts",
+        "+++ b/src/routes/purchase.ts",
+        ...fixture.hunks,
+      ].join("\n");
+      await assertEvidenceRejected(
+        input,
+        { file: "src/routes/purchase.ts", line: 20, excerpt: "fabricated" },
+        /invalid diff/i,
+      );
+    });
+  }
+});
+
+test("planner preserves Git zero-count insert and delete hunks", async () => {
+  const input = makeInput();
+  input.diffs[0]!.diff = [
+    "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+    "--- a/src/routes/purchase.ts",
+    "+++ b/src/routes/purchase.ts",
+    "@@ -3,0 +4 @@",
+    "+inserted",
+    "@@ -9 +9,0 @@",
+    "-deleted",
+  ].join("\n");
+  const fake = fakeClient(
+    planWithEvidence([
+      { file: "src/routes/purchase.ts", line: 4, excerpt: "inserted" },
+      { file: "src/routes/purchase.ts", line: 9, excerpt: "deleted" },
+    ]),
+  );
+
+  const result = await createSecurityPlanner(fake.client).plan(input);
+  assert.equal(result.hypotheses[0]?.evidence.length, 2);
+  assert.equal(fake.calls.length, 1);
+});
+
+test("planner preserves Git-generated empty-file zero-count hunk coordinates", async () => {
+  const input = makeInput();
+  input.diffs[0]!.diff = [
+    "diff --git a/src/routes/purchase.ts b/src/routes/purchase.ts",
+    "--- a/src/routes/purchase.ts",
+    "+++ b/src/routes/purchase.ts",
+    "@@ -0,0 +0,0 @@",
+  ].join("\n");
+
+  await assertEvidenceRejected(
+    input,
+    { file: "src/routes/purchase.ts", line: 1, excerpt: "fabricated" },
+    /ungrounded evidence.*not a changed line/i,
+  );
+});
+
 test("planner rejects file headers and diffs without textual changed lines", async (t) => {
   const cases = [
     {
@@ -916,9 +1342,7 @@ test("planner rejects file headers and diffs without textual changed lines", asy
           line: 1,
           excerpt: fixture.excerpt,
         },
-        fixture.name === "file headers"
-          ? /ungrounded evidence.*not a changed line/i
-          : /invalid diff/i,
+        /ungrounded evidence.*not a changed line/i,
       );
     });
   }

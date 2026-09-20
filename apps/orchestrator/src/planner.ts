@@ -44,6 +44,13 @@ type HunkState = {
   markerAllowed: boolean;
 };
 
+type CompletedHunk = {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+};
+
 type ParsedEnvelopePath = { kind: "path"; path: string } | { kind: "null" };
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/;
@@ -79,9 +86,13 @@ const decodeGitQuotedToken = (token: string): string | null => {
     const simpleEscapes: Record<string, number> = {
       '"': 0x22,
       "\\": 0x5c,
+      a: 0x07,
+      b: 0x08,
+      f: 0x0c,
       t: 0x09,
       n: 0x0a,
       r: 0x0d,
+      v: 0x0b,
     };
     const simple = simpleEscapes[escape];
     if (simple !== undefined) {
@@ -143,9 +154,20 @@ const readGitToken = (
   return null;
 };
 
-const parseDiffEnvelope = (line: string): [string, string] | null => {
+const parseDiffEnvelope = (
+  line: string,
+  path: string,
+): [string, string] | null => {
   if (!line.startsWith(DIFF_PREFIX)) return null;
   const source = line.slice(DIFF_PREFIX.length);
+  const expectedOld = `a/${path}`;
+  const expectedNew = `b/${path}`;
+  if (!source.startsWith('"')) {
+    return source === `${expectedOld} ${expectedNew}`
+      ? [expectedOld, expectedNew]
+      : null;
+  }
+
   const oldToken = readGitToken(source, 0);
   if (oldToken === null || source[oldToken.next] !== " ") return null;
   const newToken = readGitToken(source, oldToken.next + 1);
@@ -153,12 +175,27 @@ const parseDiffEnvelope = (line: string): [string, string] | null => {
   return [oldToken.value, newToken.value];
 };
 
+const stripFileHeaderMetadata = (token: string): string | null => {
+  const delimiter = token.indexOf("\t");
+  const pathToken = delimiter === -1 ? token : token.slice(0, delimiter);
+  if (pathToken.length === 0) return null;
+  if (pathToken.startsWith('"')) {
+    return delimiter === -1 || token[delimiter - 1] === '"' ? pathToken : null;
+  }
+  if (delimiter === -1 && pathToken.includes(" ")) return null;
+  return pathToken;
+};
+
 const parseFileHeader = (
   token: string,
   prefix: "a/" | "b/",
 ): ParsedEnvelopePath | null => {
-  if (token === "/dev/null") return { kind: "null" };
-  const decoded = token.startsWith('"') ? decodeGitQuotedToken(token) : token;
+  const pathToken = stripFileHeaderMetadata(token);
+  if (pathToken === null) return null;
+  if (pathToken === "/dev/null") return { kind: "null" };
+  const decoded = pathToken.startsWith('"')
+    ? decodeGitQuotedToken(pathToken)
+    : pathToken;
   if (decoded === null || !decoded.startsWith(prefix)) return null;
   return { kind: "path", path: decoded.slice(prefix.length) };
 };
@@ -179,18 +216,52 @@ const metadataKind = (line: string): DiffKind | null | undefined => {
   return undefined;
 };
 
+const binaryMarkerMatches = (line: string, path: string): boolean =>
+  line === `Binary files a/${path} and b/${path} differ`;
+
+const validateHunkRange = (
+  path: string,
+  current: CompletedHunk,
+  previous: CompletedHunk | undefined,
+): void => {
+  const { oldStart, oldCount, newStart, newCount } = current;
+  if ((oldCount > 0 && oldStart === 0) || (newCount > 0 && newStart === 0)) {
+    return invalidDiff(path, "positive-count hunk ranges must start above zero");
+  }
+  if (
+    previous === undefined &&
+    ((oldCount === 0 && newCount > 0 && oldStart + 1 !== newStart) ||
+      (newCount === 0 && oldCount > 0 && newStart + 1 !== oldStart))
+  ) {
+    return invalidDiff(path, "zero-count hunk range is not Git-canonical");
+  }
+  if (
+    previous !== undefined &&
+    (oldStart < previous.oldStart + previous.oldCount ||
+      newStart < previous.newStart + previous.newCount)
+  ) {
+    return invalidDiff(path, "hunk ranges overlap or go backwards");
+  }
+};
+
 const collectChangedLines = ({
   path,
   diff,
   truncated,
 }: FileDiff): ChangedLine[] => {
+  if (diff === "" && truncated) return [];
+
   const lines = diff.split("\n");
-  if (diff.endsWith("\n")) lines.pop();
+  if (diff.endsWith("\n")) {
+    lines.pop();
+  } else if (truncated) {
+    lines.pop();
+  }
   if (lines.length === 0 || lines[0] === "") {
     return invalidDiff(path, "missing diff --git envelope");
   }
 
-  const envelope = parseDiffEnvelope(lines[0]!);
+  const envelope = parseDiffEnvelope(lines[0]!, path);
   if (envelope === null) {
     return invalidDiff(path, "malformed diff --git envelope");
   }
@@ -204,7 +275,9 @@ const collectChangedLines = ({
   let newHeader: ParsedEnvelopePath | undefined;
   let declaredKind: DeclaredDiffKind = "unspecified";
   let hunk: HunkState | undefined;
+  let previousHunk: CompletedHunk | undefined;
   let sawHunk = false;
+  let nonTextual = false;
 
   while (index < lines.length) {
     const line = lines[index]!;
@@ -269,6 +342,14 @@ const collectChangedLines = ({
         const parsed = parseFileHeader(line.slice(OLD_HEADER_PREFIX.length), "a/");
         if (parsed === null) return invalidDiff(path, "malformed old file header");
         oldHeader = parsed;
+        index += 1;
+        continue;
+      }
+      if (binaryMarkerMatches(line, path)) {
+        if (nonTextual) {
+          return invalidDiff(path, "duplicate non-textual diff marker");
+        }
+        nonTextual = true;
         index += 1;
         continue;
       }
@@ -349,6 +430,14 @@ const collectChangedLines = ({
     ) {
       return invalidDiff(path, "hunk coordinates must be safe integers");
     }
+    const currentHunk = {
+      oldStart: oldLine,
+      oldCount: oldRemaining,
+      newStart: newLine,
+      newCount: newRemaining,
+    };
+    validateHunkRange(path, currentHunk, previousHunk);
+    previousHunk = currentHunk;
     if (declaredKind === "add" && oldRemaining !== 0) {
       return invalidDiff(path, "added-file hunk must not consume old lines");
     }
@@ -367,7 +456,11 @@ const collectChangedLines = ({
   }
 
   if (oldHeader === undefined || newHeader === undefined) {
-    return invalidDiff(path, "missing file headers");
+    if (sawHunk) return invalidDiff(path, "missing file headers");
+    return [];
+  }
+  if (nonTextual) {
+    return invalidDiff(path, "binary marker cannot accompany file headers");
   }
   if (hunk !== undefined && (hunk.oldRemaining !== 0 || hunk.newRemaining !== 0)) {
     if (!truncated) return invalidDiff(path, "incomplete hunk at end of input");
@@ -377,15 +470,19 @@ const collectChangedLines = ({
 };
 
 const validateEvidence = (plan: AnalysisPlan, diffs: FileDiff[]): void => {
-  const changedLinesByPath = new Map(
-    diffs.map((fileDiff) => [fileDiff.path, collectChangedLines(fileDiff)]),
-  );
+  const diffsByPath = new Map(diffs.map((fileDiff) => [fileDiff.path, fileDiff]));
+  const changedLinesByPath = new Map<string, ChangedLine[]>();
 
   for (const hypothesis of plan.hypotheses) {
     for (const evidence of hypothesis.evidence) {
-      const changedLines = changedLinesByPath.get(evidence.file);
-      if (changedLines === undefined) {
+      const fileDiff = diffsByPath.get(evidence.file);
+      if (fileDiff === undefined) {
         throw new Error(`Ungrounded evidence: unknown file ${evidence.file}`);
+      }
+      let changedLines = changedLinesByPath.get(evidence.file);
+      if (changedLines === undefined) {
+        changedLines = collectChangedLines(fileDiff);
+        changedLinesByPath.set(evidence.file, changedLines);
       }
 
       const excerpt = evidence.excerpt.trim();

@@ -192,6 +192,163 @@ test("json-equals treats object key order as irrelevant", async () => {
   assertSchemaValid(result);
 });
 
+const nestedJson = (depth: number, leaf: JsonValue): JsonValue => {
+  let value = leaf;
+  for (let level = 0; level < depth; level += 1) value = [value];
+  return value;
+};
+
+for (const invalidMismatch of [
+  {
+    name: "oversized actual string",
+    expected: "expected",
+    actual: "x".repeat(16_385),
+  },
+  {
+    name: "oversized expected string",
+    expected: "x".repeat(16_385),
+    actual: "actual",
+  },
+  {
+    name: "too-deep actual value",
+    expected: "expected",
+    actual: nestedJson(9, "actual"),
+  },
+  {
+    name: "too-deep expected value",
+    expected: nestedJson(9, "expected"),
+    actual: "actual",
+  },
+  {
+    name: "too-wide actual array",
+    expected: ["expected"],
+    actual: Array.from({ length: 65 }, () => "actual"),
+  },
+  {
+    name: "too-wide expected array",
+    expected: Array.from({ length: 65 }, () => "expected"),
+    actual: ["actual"],
+  },
+  {
+    name: "too-wide actual object",
+    expected: { expected: true },
+    actual: Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [`actual-${index}`, true]),
+    ),
+  },
+  {
+    name: "too-wide expected object",
+    expected: Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [`expected-${index}`, true]),
+    ),
+    actual: { actual: true },
+  },
+  {
+    name: "oversized actual object key",
+    expected: { expected: true },
+    actual: { ["x".repeat(257)]: true },
+  },
+  {
+    name: "oversized expected object key",
+    expected: { ["x".repeat(257)]: true },
+    actual: { actual: true },
+  },
+] as const) {
+  test(`json-equals returns bounded ERROR for ${invalidMismatch.name}`, async () => {
+    let callCount = 0;
+    const actual = invalidMismatch.actual as JsonValue;
+    const expected = invalidMismatch.expected as JsonValue;
+    const result = await runTestSpec(
+      responseSpec(
+        [{ kind: "json-equals", path: "$.payload", equals: expected }],
+        "unrepresentable-json",
+      ),
+      async (path) => {
+        callCount += 1;
+        if (callCount === 1) return validState();
+        if (callCount === 2) {
+          return { status: 200, json: { payload: actual } };
+        }
+        if (callCount === 3) return validState();
+        assert.fail(`unexpected send call for ${path}`);
+      },
+    );
+
+    assert.equal(callCount, 3);
+    assert.equal(result.verdict, "ERROR");
+    assert.equal(result.executed, false);
+    assert.deepEqual(result.evidence, [
+      {
+        kind: "evaluation-error",
+        expected: "bounded-json-values",
+        actual: "unrepresentable-mismatch",
+      },
+    ]);
+    const serializedResult = JSON.stringify(result);
+    assert.ok(serializedResult.length < 1_000);
+    if (typeof actual === "string" && actual.length > 1_000) {
+      assert.equal(serializedResult.includes(actual), false);
+    }
+    if (typeof expected === "string" && expected.length > 1_000) {
+      assert.equal(serializedResult.includes(expected), false);
+    }
+    assert.equal(serializedResult.includes("Too big"), false);
+    assert.equal(serializedResult.includes("Invalid input"), false);
+    assertSchemaValid(result);
+  });
+}
+
+for (const matchingBoundary of [
+  {
+    name: "oversized string",
+    value: "x".repeat(16_385),
+  },
+  {
+    name: "too-deep value",
+    value: nestedJson(9, "matching"),
+  },
+  {
+    name: "too-wide array",
+    value: Array.from({ length: 65 }, () => "matching"),
+  },
+  {
+    name: "too-wide object",
+    value: Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [`matching-${index}`, true]),
+    ),
+  },
+  {
+    name: "oversized object key",
+    value: { ["x".repeat(257)]: true },
+  },
+] as const) {
+  test(`json-equals may block for a matching ${matchingBoundary.name}`, async () => {
+    let callCount = 0;
+    const value = matchingBoundary.value as JsonValue;
+    const send = sendSequence(
+      validState(),
+      { status: 200, json: { payload: value } },
+      validState(),
+    );
+    const result = await runTestSpec(
+      responseSpec(
+        [{ kind: "json-equals", path: "$.payload", equals: value }],
+        "matching-unrepresentable-json",
+      ),
+      async (...args) => {
+        callCount += 1;
+        return send(...args);
+      },
+    );
+
+    assert.equal(callCount, 3);
+    assert.equal(result.verdict, "BLOCKED");
+    assert.equal(result.executed, true);
+    assert.deepEqual(result.evidence, []);
+    assertSchemaValid(result);
+  });
+}
+
 for (const path of [
   "$.payload.__proto__",
   "$.payload.prototype",
@@ -269,6 +426,84 @@ for (const invalid of [
         actual: "invalid-state-shape",
       },
     ]);
+    assertSchemaValid(result);
+  });
+}
+
+for (const [name, equals, assertionKind] of [
+  ["string", "0", "state-delta"],
+  ["null", null, "state-delta"],
+  ["object", { amount: 0 }, "state-delta"],
+  ["NaN", Number.NaN, "state-delta-live"],
+  ["positive infinity", Number.POSITIVE_INFINITY, "state-delta-live"],
+  ["negative infinity", Number.NEGATIVE_INFINITY, "state-delta-live"],
+] as const) {
+  test(`state-delta rejects ${name} equals before sending`, async () => {
+    let callCount = 0;
+    const assertion = {
+      kind: assertionKind,
+      key: "balance",
+      equals,
+    } as unknown as TestSpec["assertions"][number];
+    if (assertionKind === "state-delta-live") {
+      assertion.kind = "state-delta";
+    }
+    const result = await runTestSpec(
+      responseSpec([assertion], "invalid-delta-equals"),
+      async () => {
+        callCount += 1;
+        return validState();
+      },
+    );
+
+    assert.equal(callCount, 0);
+    assert.equal(result.verdict, "ERROR");
+    assert.equal(result.executed, false);
+    assert.deepEqual(result.evidence, [
+      {
+        kind: "invalid-state-delta",
+        expected: "finite-number",
+        actual: "invalid-equals",
+      },
+    ]);
+    assertSchemaValid(result);
+  });
+}
+
+for (const [name, beforeBalance, afterBalance] of [
+  ["positive", -Number.MAX_VALUE, Number.MAX_VALUE],
+  ["negative", Number.MAX_VALUE, -Number.MAX_VALUE],
+] as const) {
+  test(`state-delta returns bounded ERROR for ${name} overflow`, async () => {
+    const calls: string[] = [];
+    const secret = `must-not-leak-from-${name}-overflow`;
+    const result = await runTestSpec(
+      responseSpec(
+        [{ kind: "state-delta", key: "balance", equals: 0 }],
+        "overflowing-delta",
+      ),
+      async (path) => {
+        calls.push(path);
+        if (calls.length === 1) return validState(beforeBalance);
+        if (calls.length === 2) return { status: 200, json: { detail: secret } };
+        return validState(afterBalance);
+      },
+    );
+
+    assert.equal(calls.length, 3);
+    assert.equal(result.verdict, "ERROR");
+    assert.equal(result.executed, false);
+    assert.deepEqual(result.evidence, [
+      {
+        kind: "evaluation-error",
+        expected: "finite-state-delta",
+        actual: "unrepresentable-state-delta",
+      },
+    ]);
+    const serializedResult = JSON.stringify(result);
+    assert.equal(serializedResult.includes(secret), false);
+    assert.equal(serializedResult.includes("Infinity"), false);
+    assert.equal(serializedResult.includes("ZodError"), false);
     assertSchemaValid(result);
   });
 }

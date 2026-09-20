@@ -1,5 +1,6 @@
 import {
   executionResultSchema,
+  jsonValueSchema,
   type ExecutionResult,
   type JsonValue,
   type TestSpec,
@@ -120,6 +121,28 @@ const invalidStateEvidence = (): Evidence => [
   },
 ];
 
+const invalidStateDeltaEvidence = (): Evidence => [
+  {
+    kind: "invalid-state-delta",
+    expected: "finite-number",
+    actual: "invalid-equals",
+  },
+];
+
+const evaluationErrorEvidence = (
+  expected: "assertion-evaluated" | "bounded-json-values" | "finite-state-delta",
+  actual: "assertion-failed" | "unrepresentable-mismatch" | "unrepresentable-state-delta",
+): Evidence => [
+  {
+    kind: "evaluation-error",
+    expected,
+    actual,
+  },
+];
+
+const isEvidenceJsonValue = (value: JsonValue): boolean =>
+  jsonValueSchema.safeParse(value).success;
+
 const stateHasKeys = (
   state: HttpResult,
   keys: ReadonlyArray<"balance" | "inventoryCount">,
@@ -191,6 +214,15 @@ export const runTestSpec = async (
       },
     ]);
   }
+  if (
+    spec.assertions.some(
+      (assertion) =>
+        assertion.kind === "state-delta" &&
+        (typeof assertion.equals !== "number" || !Number.isFinite(assertion.equals)),
+    )
+  ) {
+    return resultFor(spec, "ERROR", false, invalidStateDeltaEvidence());
+  }
   const stateKeys = ["balance", "inventoryCount"] as const;
   let before: HttpResult;
   try {
@@ -217,10 +249,18 @@ export const runTestSpec = async (
   }
 
   const responseEvidence: Evidence = [];
+  let responseEvaluationError: "unsupported-path" | "unrepresentable" | "evaluation" | undefined;
   try {
     for (const assertion of spec.assertions) {
       if (assertion.kind === "status") {
         if (response.status !== assertion.equals) {
+          if (
+            !isEvidenceJsonValue(assertion.equals) ||
+            !isEvidenceJsonValue(response.status)
+          ) {
+            responseEvaluationError = "unrepresentable";
+            break;
+          }
           responseEvidence.push({
             kind: "status",
             expected: assertion.equals,
@@ -232,8 +272,18 @@ export const runTestSpec = async (
 
       if (assertion.kind === "json-equals") {
         const resolved = resolveJsonPath(response.json, assertion.path);
-        if (!resolved.ok) return unsupportedPathError(spec);
+        if (!resolved.ok) {
+          responseEvaluationError = "unsupported-path";
+          break;
+        }
         if (!jsonEquals(resolved.value, assertion.equals)) {
+          if (
+            !isEvidenceJsonValue(assertion.equals) ||
+            !isEvidenceJsonValue(resolved.value)
+          ) {
+            responseEvaluationError = "unrepresentable";
+            break;
+          }
           responseEvidence.push({
             kind: "json-equals",
             expected: assertion.equals,
@@ -243,13 +293,18 @@ export const runTestSpec = async (
       }
     }
   } catch {
-    return resultFor(spec, "ERROR", false, [
-      {
-        kind: "evaluation-error",
-        expected: "assertion-evaluated",
-        actual: "assertion-failed",
-      },
-    ]);
+    responseEvaluationError = "evaluation";
+  }
+  if (responseEvaluationError === "unsupported-path") {
+    return unsupportedPathError(spec);
+  }
+  if (responseEvaluationError === "evaluation") {
+    return resultFor(
+      spec,
+      "ERROR",
+      false,
+      evaluationErrorEvidence("assertion-evaluated", "assertion-failed"),
+    );
   }
 
   let after: HttpResult;
@@ -264,6 +319,14 @@ export const runTestSpec = async (
   if (!stateHasKeys(after, stateKeys)) {
     return resultFor(spec, "ERROR", false, invalidStateEvidence());
   }
+  if (responseEvaluationError === "unrepresentable") {
+    return resultFor(
+      spec,
+      "ERROR",
+      false,
+      evaluationErrorEvidence("bounded-json-values", "unrepresentable-mismatch"),
+    );
+  }
 
   const evidence = [...responseEvidence];
   try {
@@ -272,7 +335,26 @@ export const runTestSpec = async (
       const beforeValue = numericStateValue(before, assertion.key)!;
       const afterValue = numericStateValue(after, assertion.key)!;
       const actual = afterValue - beforeValue;
+      if (!Number.isFinite(actual)) {
+        return resultFor(
+          spec,
+          "ERROR",
+          false,
+          evaluationErrorEvidence("finite-state-delta", "unrepresentable-state-delta"),
+        );
+      }
       if (!jsonEquals(actual, assertion.equals)) {
+        if (
+          !isEvidenceJsonValue(assertion.equals) ||
+          !isEvidenceJsonValue(actual)
+        ) {
+          return resultFor(
+            spec,
+            "ERROR",
+            false,
+            evaluationErrorEvidence("bounded-json-values", "unrepresentable-mismatch"),
+          );
+        }
         evidence.push({
           kind: "state-delta",
           expected: assertion.equals,

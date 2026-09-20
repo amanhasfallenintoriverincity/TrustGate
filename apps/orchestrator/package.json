@@ -33,6 +33,14 @@
     "./sandbox-runner": {
       "types": "./dist/sandbox-runner.d.ts",
       "default": "./dist/sandbox-runner.js"
+    },
+    "./verdict": {
+      "types": "./dist/verdict.d.ts",
+      "default": "./dist/verdict.js"
+    },
+    "./report": {
+      "types": "./dist/report.d.ts",
+      "default": "./dist/report.js"
     }
   },
   "engines": {

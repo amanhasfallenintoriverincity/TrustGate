@@ -124,24 +124,40 @@ export const executionResultSchema = z.object({
   executed: z.boolean(),
   evidence: z.array(executionEvidenceSchema).max(64),
 }).strict().superRefine((value, ctx) => {
-  if (value.verdict !== "CONFIRMED") {
-    return;
+  if (value.verdict === "CONFIRMED") {
+    if (!value.executed) {
+      ctx.addIssue({
+        code: "custom",
+        message: "CONFIRMED requires executed=true",
+        path: ["executed"],
+      });
+    }
+
+    if (value.evidence.length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "CONFIRMED requires at least one evidence item",
+        path: ["evidence"],
+      });
+    }
   }
 
-  if (!value.executed) {
-    ctx.addIssue({
-      code: "custom",
-      message: "CONFIRMED requires executed=true",
-      path: ["executed"],
-    });
-  }
+  if (value.verdict === "BLOCKED") {
+    if (!value.executed) {
+      ctx.addIssue({
+        code: "custom",
+        message: "BLOCKED requires executed=true",
+        path: ["executed"],
+      });
+    }
 
-  if (value.evidence.length === 0) {
-    ctx.addIssue({
-      code: "custom",
-      message: "CONFIRMED requires at least one evidence item",
-      path: ["evidence"],
-    });
+    if (value.evidence.length !== 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "BLOCKED requires empty evidence",
+        path: ["evidence"],
+      });
+    }
   }
 });
 

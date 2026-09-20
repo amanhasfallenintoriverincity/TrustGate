@@ -89,7 +89,7 @@ test("runner snapshots a validated plan and sends only normalized JSON", async (
         plan.hypotheses[0]!.tests[0]!.request.path = "/api/transfer";
         return {
           stdout: JSON.stringify([makeResult("negative-price")]),
-          stderr: " \n\t",
+          stderr: "",
         };
       },
     });
@@ -323,20 +323,24 @@ test("malformed, oversized, and schema-invalid stdout fail closed", async () => 
   });
 });
 
-test("stderr content is rejected without disclosure", async () => {
+test("any stderr content, including whitespace, is rejected without disclosure", async () => {
   await withRuntime(async (hostRuntime) => {
-    const runner = createSandboxRunner({
-      image,
-      hostRuntime,
-      runProcess: async () => ({
-        stdout: JSON.stringify([makeResult("negative-price")]),
-        stderr: "sensitive stderr marker",
-      }),
-    });
+    for (const stderr of ["sensitive stderr marker", " \n\t"]) {
+      const runner = createSandboxRunner({
+        image,
+        hostRuntime,
+        runProcess: async () => ({
+          stdout: JSON.stringify([makeResult("negative-price")]),
+          stderr,
+        }),
+      });
 
-    const message = await rejectionMessage(runner.run("patched", makePlan("negative-price")));
-    assert.equal(message, "sandbox execution failed");
-    assert.doesNotMatch(message, /sensitive/);
+      const message = await rejectionMessage(
+        runner.run("patched", makePlan("negative-price")),
+      );
+      assert.equal(message, "sandbox execution failed");
+      assert.doesNotMatch(message, /sensitive/);
+    }
   });
 });
 

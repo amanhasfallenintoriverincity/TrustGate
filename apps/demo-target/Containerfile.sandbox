@@ -5,34 +5,79 @@ WORKDIR /build
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/contracts/package.json packages/contracts/tsconfig.json packages/contracts/tsconfig.build.json packages/contracts/
 COPY packages/contracts/src packages/contracts/src
-COPY llm-gateway/package.json llm-gateway/tsconfig.json llm-gateway/tsconfig.build.json llm-gateway/
-COPY llm-gateway/src llm-gateway/src
 COPY apps/orchestrator/package.json apps/orchestrator/tsconfig.json apps/orchestrator/tsconfig.build.json apps/orchestrator/
-COPY apps/orchestrator/src apps/orchestrator/src
+COPY apps/orchestrator/src/spec-runner.ts apps/orchestrator/src/spec-runner.ts
 COPY apps/demo-target/package.json apps/demo-target/tsconfig.json apps/demo-target/tsconfig.build.json apps/demo-target/
 COPY apps/demo-target/src apps/demo-target/src
 
 RUN npm ci --ignore-scripts --no-audit --no-fund \
  && npm run build -w @trustgate/contracts \
- && npm run build -w @trustgate/llm-gateway \
- && npm run build -w @trustgate/orchestrator \
+ && npm exec -- tsc \
+      --target ES2022 \
+      --module NodeNext \
+      --moduleResolution NodeNext \
+      --strict \
+      --noUncheckedIndexedAccess \
+      --exactOptionalPropertyTypes \
+      --verbatimModuleSyntax \
+      --skipLibCheck \
+      --types node \
+      --declaration \
+      --rootDir apps/orchestrator/src \
+      --outDir apps/orchestrator/dist \
+      apps/orchestrator/src/spec-runner.ts \
  && npm exec -- tsc -p apps/demo-target/tsconfig.build.json \
- && npm prune --omit=dev --ignore-scripts --no-audit --no-fund \
- && rm -rf \
-      node_modules/.bin \
-      node_modules/@alibaba-group \
-      node_modules/@types \
-      node_modules/tsx \
-      node_modules/typescript \
-      apps/demo-target/dist/*.d.ts \
-      apps/orchestrator/dist/*.d.ts \
-      apps/orchestrator/dist/prompts \
-      llm-gateway/dist/*.d.ts \
-      packages/contracts/dist/*.d.ts \
-      apps/orchestrator/src \
-      apps/demo-target/src \
-      packages/contracts/src \
-      llm-gateway/src
+ && mkdir -p /runtime/apps/demo-target/dist \
+             /runtime/apps/orchestrator/dist \
+             /runtime/packages/contracts/dist \
+             /runtime/node_modules \
+ && cp apps/demo-target/dist/sandbox-main.js \
+       apps/demo-target/dist/server.js \
+       apps/demo-target/dist/store.js \
+       /runtime/apps/demo-target/dist/ \
+ && cp apps/orchestrator/dist/spec-runner.js \
+       /runtime/apps/orchestrator/dist/spec-runner.js \
+ && cp packages/contracts/dist/index.js \
+       /runtime/packages/contracts/dist/index.js \
+ && printf '%s\n' '{"private":true}' > /runtime/package.json \
+ && npm install \
+      --prefix /runtime \
+      --ignore-scripts \
+      --no-audit \
+      --no-fund \
+      --omit=dev \
+      --package-lock=false \
+      --no-save \
+      fastify@5.12.5 zod@4.6.5 \
+ && rm -rf /runtime/node_modules/@trustgate/contracts \
+             /runtime/node_modules/@trustgate/orchestrator \
+ && mkdir -p /runtime/node_modules/@trustgate/contracts/dist \
+             /runtime/node_modules/@trustgate/orchestrator/dist \
+ && printf '%s\n' \
+      '{"name":"@trustgate/contracts","type":"module","exports":"./dist/index.js"}' \
+      > /runtime/node_modules/@trustgate/contracts/package.json \
+ && cp /runtime/packages/contracts/dist/index.js \
+       /runtime/node_modules/@trustgate/contracts/dist/index.js \
+ && printf '%s\n' \
+      '{"name":"@trustgate/orchestrator","type":"module","exports":{"./spec-runner":"./dist/spec-runner.js"}}' \
+      > /runtime/node_modules/@trustgate/orchestrator/package.json \
+ && cp /runtime/apps/orchestrator/dist/spec-runner.js \
+       /runtime/node_modules/@trustgate/orchestrator/dist/spec-runner.js \
+ && find /runtime/node_modules -depth -type d \
+      \( -name .bin -o -name .cache -o -name .github \
+         -o -name benchmark -o -name benchmarks -o -name docs \
+         -o -name examples -o -name integration -o -name scripts \
+         -o -name test -o -name tests -o -name spec \) \
+      -exec rm -rf {} + \
+ && find /runtime/node_modules -type f \
+      \( -name '*.d.ts' -o -name '*.map' -o -name '*.md' \
+         -o -name '*.ts' -o -name '*.test.*' -o -name '*.spec.*' \
+         -o -name 'benchmark.js' -o -name 'example.js' -o -name 'example.mjs' \
+         -o -name 'test.js' -o -name 'eslint.config.js' -o -name 'tsconfig.json' \
+         -o -name 'tap-snapshots.test.js' \) \
+      -delete \
+ && rm -f /runtime/node_modules/.package-lock.json \
+ && printf '%s\n' '{"private":true,"type":"module"}' > /runtime/package.json
 
 FROM docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS runtime
 
@@ -44,16 +89,7 @@ RUN mkdir -p /app \
  && chown 65532:65532 /app
 WORKDIR /app
 
-COPY --from=build --chown=65532:65532 /build/package.json /build/package-lock.json ./
-COPY --from=build --chown=65532:65532 /build/node_modules ./node_modules
-COPY --from=build --chown=65532:65532 /build/apps/demo-target/package.json apps/demo-target/package.json
-COPY --from=build --chown=65532:65532 /build/apps/demo-target/dist apps/demo-target/dist
-COPY --from=build --chown=65532:65532 /build/apps/orchestrator/package.json apps/orchestrator/package.json
-COPY --from=build --chown=65532:65532 /build/apps/orchestrator/dist apps/orchestrator/dist
-COPY --from=build --chown=65532:65532 /build/packages/contracts/package.json packages/contracts/package.json
-COPY --from=build --chown=65532:65532 /build/packages/contracts/dist packages/contracts/dist
-COPY --from=build --chown=65532:65532 /build/llm-gateway/package.json llm-gateway/package.json
-COPY --from=build --chown=65532:65532 /build/llm-gateway/dist llm-gateway/dist
+COPY --from=build --chown=65532:65532 /runtime/ ./
 
 USER 65532:65532
 CMD ["node", "apps/demo-target/dist/sandbox-main.js"]

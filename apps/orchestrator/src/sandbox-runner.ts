@@ -287,7 +287,7 @@ export const createSandboxRunner = (options: SandboxRunnerOptions) => {
         );
         if (privateConfig.path !== configPath) throw genericExecutionError();
         const output = await runProcess(policy, stdin);
-        if (output.stderr.trim().length !== 0) throw genericExecutionError();
+        if (output.stderr !== "") throw genericExecutionError();
         return validateResults(output.stdout, expected);
       } catch {
         throw genericExecutionError();

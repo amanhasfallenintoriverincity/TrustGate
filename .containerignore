@@ -1,7 +1,7 @@
 # Deny the repository build context by default.
 **
 
-# Task 10 sandbox image: exact build manifests, configs, and source only.
+# Task 10 sandbox image: exact build inputs only.
 !package.json
 !package-lock.json
 !tsconfig.base.json
@@ -11,7 +11,7 @@
 !apps/orchestrator/tsconfig.json
 !apps/orchestrator/tsconfig.build.json
 !apps/orchestrator/src
-!apps/orchestrator/src/*.ts
+!apps/orchestrator/src/spec-runner.ts
 !apps/demo-target
 !apps/demo-target/package.json
 !apps/demo-target/tsconfig.json
@@ -26,12 +26,6 @@
 !packages/contracts/tsconfig.build.json
 !packages/contracts/src
 !packages/contracts/src/*.ts
-!llm-gateway
-!llm-gateway/package.json
-!llm-gateway/tsconfig.json
-!llm-gateway/tsconfig.build.json
-!llm-gateway/src
-!llm-gateway/src/*.ts
 
 # Final exclusions remain authoritative for generated and sensitive content.
 .git

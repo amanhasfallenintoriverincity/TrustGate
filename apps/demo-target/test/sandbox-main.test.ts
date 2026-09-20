@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -363,4 +364,22 @@ test("main fails generically for malformed, oversized, schema-invalid input and 
     assert.doesNotMatch(stderr.join(""), new RegExp(secret));
     assert.ok(Buffer.byteLength(stderr.join(""), "utf8") < 128);
   }
+});
+
+test("sandbox runtime image copies only the execution graph", () => {
+  const containerfile = readFileSync(
+    new URL("../Containerfile.sandbox", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(containerfile, /llm-gateway/);
+  assert.doesNotMatch(containerfile, /@openai-oauth/);
+  assert.doesNotMatch(containerfile, /npm prune/);
+  assert.doesNotMatch(containerfile, /\/build\/node_modules(?:\s|$)/m);
+  assert.doesNotMatch(
+    containerfile,
+    /COPY[^\n]*apps\/orchestrator\/dist(?:\s|$)/m,
+  );
+  assert.match(containerfile, /apps\/orchestrator\/dist\/spec-runner\.js/);
+  assert.match(containerfile, /packages\/contracts\/dist\/index\.js/);
 });

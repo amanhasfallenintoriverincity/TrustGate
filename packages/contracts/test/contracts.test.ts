@@ -410,3 +410,39 @@ test("execution result cannot mark an unexecuted hypothesis confirmed", () => {
     "65 execution evidence items must be rejected",
   );
 });
+
+test("execution result requires an executed BLOCKED verdict with empty evidence", () => {
+  const blocked = {
+    runId: "run-1",
+    hypothesisId: "price-authority",
+    verdict: "BLOCKED",
+    executed: true,
+    evidence: [],
+  };
+  assert.equal(
+    executionResultSchema.safeParse(blocked).success,
+    true,
+    "BLOCKED with executed=true and empty evidence must be accepted",
+  );
+  assert.equal(
+    executionResultSchema.safeParse({ ...blocked, executed: false }).success,
+    false,
+    "BLOCKED with executed=false must be rejected",
+  );
+  assert.equal(
+    executionResultSchema.safeParse({ ...blocked, evidence: [validEvidence] }).success,
+    false,
+    "BLOCKED with evidence must be rejected",
+  );
+
+  for (const validFailClosed of [
+    { ...blocked, verdict: "UNVERIFIED", executed: false, evidence: [] },
+    { ...blocked, verdict: "ERROR", executed: false, evidence: [validEvidence] },
+  ]) {
+    assert.equal(
+      executionResultSchema.safeParse(validFailClosed).success,
+      true,
+      `${validFailClosed.verdict} semantics must remain valid`,
+    );
+  }
+});

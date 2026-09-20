@@ -278,6 +278,107 @@ test("report rejects a raw prompt marker in hypothesis evidence", () => {
   assert.equal(rejectionMessage(input), "run report rejected");
 });
 
+const invalidEvidenceFiles = [
+  "apps/demo-target/src/unreviewed.ts",
+  "../outside.ts",
+  "apps/demo-target/src/../outside.ts",
+  "/workspace/project/src/store.ts",
+  "/srv/project/src/store.ts",
+] as const;
+
+for (const file of invalidEvidenceFiles) {
+  test(`report rejects hypothesis evidence file: ${file}`, () => {
+    const input = makeInput();
+    input.hypotheses[0]!.evidence[0]!.file = file;
+
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+}
+
+test("report accepts hypothesis evidence for an exact reviewed path", () => {
+  const input = makeInput();
+  input.reviewedFiles.push("apps/demo-target/src/routes.ts");
+  input.hypotheses[0]!.evidence[0]!.file = "apps/demo-target/src/routes.ts";
+
+  const report = createRunReport(input);
+
+  assert.equal(
+    report.hypotheses[0]?.evidence[0]?.file,
+    "apps/demo-target/src/routes.ts",
+  );
+});
+
+const sensitiveSuffixKeys = [
+  "promptValue",
+  "authorizationValue",
+  "tokenValue",
+  "passwordValue",
+  "secretValue",
+  "credentialValue",
+  "errorData",
+  "rawPromptText",
+  "authConfig",
+  "oauthData",
+  "sessionTokenMaterial",
+  "repositoryPath",
+  "environmentVariables",
+  "apiKeyData",
+  "accessTokenText",
+  "clientSecretMaterial",
+  "credentialsConfig",
+  "apiKeyDataPayload",
+  "secretValueContent",
+  "tokenMaterialsConfig",
+  "sessiontokenmaterial",
+  "rawprompttext",
+] as const;
+
+for (const key of sensitiveSuffixKeys) {
+  test(`report rejects sensitive suffix key: ${key}`, () => {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = {
+      [key]: "public-example",
+    };
+
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+}
+
+test("report rejects plural and chained sensitive suffix keys", () => {
+  for (const key of [
+    "tokens",
+    "passwords",
+    "secrets",
+    "credentials",
+    "apiKeys",
+    "prompts",
+    "errors",
+    "secretMaterials",
+    "apiKeyDataPayload",
+    "tokenMaterialsConfig",
+  ]) {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = {
+      [key]: "public-example",
+    };
+
+    assert.equal(rejectionMessage(input), "run report rejected", key);
+  }
+});
+
+test("report rejects plural sensitive assignments in string values", () => {
+  for (const value of [
+    "tokens=opaque-value",
+    "passwords=opaque-value",
+    "secrets=opaque-value",
+  ]) {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = { note: value };
+
+    assert.equal(rejectionMessage(input), "run report rejected", value);
+  }
+});
+
 const sensitiveBodyKeys = [
   "prompt",
   "systemPrompt",
@@ -322,6 +423,19 @@ const sensitiveBodyKeys = [
   "sessionTokenValue",
   "oauthTokenValue",
   "secretariatToken",
+  "promptValue",
+  "authorizationValue",
+  "tokenValue",
+  "passwordValue",
+  "secretValue",
+  "credentialValue",
+  "errorData",
+  "rawPromptText",
+  "authConfig",
+  "oauthData",
+  "sessionTokenMaterial",
+  "repositoryPath",
+  "environmentVariables",
   "environmentName",
   "accessKeyId",
   "secretAccessKey",
@@ -476,16 +590,54 @@ test("report accepts safe source filenames that contain security-language stems"
     "src/token.ts",
     "src/authorization.ts",
   ];
+  input.hypotheses[0]!.evidence[0]!.file = "src/passwordless.ts";
   input.hypotheses[0]!.tests[0]!.request.body = {
     tokenCount: 1,
     tokenizer: "public",
     passwordless: true,
     credentialing: "training",
     secretariat: "office",
+    tokenizerData: "public",
+    passwordlessConfig: "enabled",
+    credentialingMaterial: "training",
+    secretariatText: "office",
     environmentalImpact: "low",
   };
 
   assert.deepEqual(createRunReport(input).reviewedFiles, input.reviewedFiles);
+});
+
+test("report accepts safe near-words outside sensitive-key families", () => {
+  const input = makeInput();
+  input.hypotheses[0]!.tests[0]!.request.body = {
+    tokenCount: 1,
+    tokenizer: "public",
+    passwordless: true,
+    credentialing: "training",
+    secretariat: "office",
+  };
+
+  assert.equal(createRunReport(input).regressionVerdict, "FIXED");
+});
+
+test("report rejects sensitive family suffix keys", () => {
+  for (const key of [
+    "loginToken",
+    "rootPassword",
+    "jwtSecret",
+    "appCredential",
+    "requestPrompt",
+    "serviceAuthorization",
+    "runtimeError",
+    "repositoryPath",
+  ]) {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = {
+      [key]: "public-example",
+    };
+
+    assert.equal(rejectionMessage(input), "run report rejected", key);
+  }
 });
 
 const jsonOriginViolations: ReadonlyArray<readonly [string, () => unknown]> = [
@@ -651,6 +803,187 @@ test("report rejects toJSON methods without invoking them", () => {
 
   assert.equal(rejectionMessage(input), "run report rejected");
   assert.equal(calls, 0);
+});
+
+for (const key of ["__proto__", "prototype", "constructor"] as const) {
+  test(`report rejects nested prototype-sensitive own key: ${key}`, () => {
+    const input = makeInput();
+    const value = JSON.parse(
+      `{"outer":{"inner":{"${key}":{"safe":"value"}}}}`,
+    ) as Record<string, Record<string, Record<string, unknown>>>;
+    setRequestBody(input, value);
+
+    assert.equal(Object.hasOwn(value.outer!.inner!, key), true);
+    assert.equal(rejectionMessage(input), "run report rejected");
+    assert.equal(Object.hasOwn(value.outer!.inner!, key), true);
+  });
+}
+
+test("report snapshots object proxy keys and descriptors exactly once", () => {
+  const input = makeInput();
+  let ownKeyReads = 0;
+  let descriptorReads = 0;
+  const target = { safe: "value" };
+  const value = new Proxy(target, {
+    ownKeys(current) {
+      ownKeyReads += 1;
+      if (ownKeyReads > 1) throw new Error("object own keys observed twice");
+      return Reflect.ownKeys(current);
+    },
+    getOwnPropertyDescriptor(current, key) {
+      descriptorReads += 1;
+      if (descriptorReads > 1) {
+        throw new Error("object descriptor observed twice");
+      }
+      return Reflect.getOwnPropertyDescriptor(current, key);
+    },
+  });
+  setRequestBody(input, value);
+
+  const report = createRunReport(input);
+
+  assert.deepEqual(report.hypotheses[0]?.tests[0]?.request.body, {
+    safe: "value",
+  });
+  assert.deepEqual(
+    { ownKeyReads, descriptorReads },
+    { ownKeyReads: 1, descriptorReads: 1 },
+  );
+});
+
+test("report snapshots array proxy keys descriptors and length exactly once", () => {
+  const input = makeInput();
+  let ownKeyReads = 0;
+  const descriptorReads = new Map<PropertyKey, number>();
+  let lengthValueReads = 0;
+  const target = ["first", "second"];
+  const value = new Proxy(target, {
+    ownKeys(current) {
+      ownKeyReads += 1;
+      if (ownKeyReads > 1) throw new Error("array own keys observed twice");
+      return Reflect.ownKeys(current);
+    },
+    getOwnPropertyDescriptor(current, key) {
+      const reads = (descriptorReads.get(key) ?? 0) + 1;
+      descriptorReads.set(key, reads);
+      if (reads > 1) throw new Error(`array descriptor observed twice: ${String(key)}`);
+      return Reflect.getOwnPropertyDescriptor(current, key);
+    },
+    get(current, key, receiver) {
+      if (key === "length") lengthValueReads += 1;
+      return Reflect.get(current, key, receiver);
+    },
+  });
+  setRequestBody(input, value);
+
+  const report = createRunReport(input);
+
+  assert.deepEqual(report.hypotheses[0]?.tests[0]?.request.body, [
+    "first",
+    "second",
+  ]);
+  assert.deepEqual(
+    {
+      ownKeyReads,
+      zeroDescriptorReads: descriptorReads.get("0"),
+      oneDescriptorReads: descriptorReads.get("1"),
+      lengthDescriptorReads: descriptorReads.get("length"),
+      lengthValueReads,
+    },
+    {
+      ownKeyReads: 1,
+      zeroDescriptorReads: 1,
+      oneDescriptorReads: 1,
+      lengthDescriptorReads: 1,
+      lengthValueReads: 0,
+    },
+  );
+});
+
+test("report rejects proxy descriptor trap errors generically", () => {
+  const input = makeInput();
+  let valueReads = 0;
+  const value = new Proxy(
+    { safe: "value" },
+    {
+      ownKeys(current) {
+        return Reflect.ownKeys(current);
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error("attacker controlled descriptor failure");
+      },
+      get() {
+        valueReads += 1;
+        return "attacker controlled value";
+      },
+    },
+  );
+  setRequestBody(input, value);
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+  assert.equal(valueReads, 0);
+});
+
+test("report rejects a proxy array with a malformed captured length descriptor", () => {
+  const input = makeInput();
+  let lengthValueReads = 0;
+  const target = ["first", "second"];
+  Object.defineProperty(target, "length", { writable: false });
+  const value = new Proxy(target, {
+    ownKeys(current) {
+      return Reflect.ownKeys(current);
+    },
+    getOwnPropertyDescriptor(current, key) {
+      if (key === "length") {
+        return {
+          configurable: false,
+          enumerable: false,
+          value: "2",
+          writable: false,
+        };
+      }
+      return Reflect.getOwnPropertyDescriptor(current, key);
+    },
+    get(current, key, receiver) {
+      if (key === "length") lengthValueReads += 1;
+      return Reflect.get(current, key, receiver);
+    },
+  });
+  setRequestBody(input, value);
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+  assert.equal(lengthValueReads, 0);
+});
+
+test("report rejects a proxy array with an enumerable length descriptor", () => {
+  const input = makeInput();
+  let lengthValueReads = 0;
+  const target = ["first", "second"];
+  Object.defineProperty(target, "length", { writable: false });
+  const value = new Proxy(target, {
+    ownKeys(current) {
+      return Reflect.ownKeys(current);
+    },
+    getOwnPropertyDescriptor(current, key) {
+      if (key === "length") {
+        return {
+          configurable: false,
+          enumerable: true,
+          value: 2,
+          writable: false,
+        };
+      }
+      return Reflect.getOwnPropertyDescriptor(current, key);
+    },
+    get(current, key, receiver) {
+      if (key === "length") lengthValueReads += 1;
+      return Reflect.get(current, key, receiver);
+    },
+  });
+  setRequestBody(input, value);
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+  assert.equal(lengthValueReads, 0);
 });
 
 test("report rejects secrets in deeply nested JSON values", () => {
@@ -903,6 +1236,9 @@ test("report rejects serialized output above one MiB", () => {
     hypotheses.push(hypothesis);
   }
   input.hypotheses = hypotheses;
+  input.reviewedFiles = hypotheses.flatMap((hypothesis) =>
+    hypothesis.evidence.map(({ file }) => file),
+  );
   input.vulnerableResults = vulnerableResults;
   input.patchedResults = patchedResults;
 

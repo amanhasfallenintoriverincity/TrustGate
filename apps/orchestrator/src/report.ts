@@ -80,12 +80,12 @@ const SENSITIVE_STRING_PATTERNS = [
   /\bauthorization\s*[:=]\s*\S+/i,
   /\bbearer\s+(?!(?:authentication|authorization|scheme|header)\b)\S+/i,
   /\b(?:(?:[A-Za-z0-9]+[_-])*api[_-]?key|x[-_]?api[-_]?key)\s*[:=]\s*\S+/i,
-  /\b(?:(?:github|session|access|refresh|oauth)[_-]?token|token)\s*[:=]\s*\S+/i,
-  /\b(?:(?:db[_-]?)?password|passwd)\s*[:=]\s*\S+/i,
-  /\b(?:client[_-]?secret|secret)\s*[:=]\s*\S+/i,
+  /\b(?:(?:github|session|access|refresh|oauth)[_-]?token|token)s?\s*[:=]\s*\S+/i,
+  /\b(?:(?:db[_-]?)?password|passwd)s?\s*[:=]\s*\S+/i,
+  /\b(?:client[_-]?secret|secret)s?\s*[:=]\s*\S+/i,
   /\bcredentials?\s*[:=]\s*\S+/i,
   /\b(?:api[-_ ]?key|token|password|credential|secret)[-_ ]?marker\b/i,
-  /\b(?:authorization|bearer|api[-_ ]?key|session[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|oauth[-_ ]?token|password|passwd|client[-_ ]?secret|secret|credential|aws[_-]?secret[_-]?access[_-]?key)s?\s*[:=]\s*\S+/i,
+  /\b(?:authorization|bearer|api[-_ ]?key|session[-_ ]?token|access[-_ ]?token|refresh[-_ ]?token|oauth[-_ ]?token|token|password|passwd|client[-_ ]?secret|secret|credential|aws[_-]?secret[_-]?access[_-]?key)s?\s*[:=]\s*\S+/i,
   /\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/i,
   /\b(?:gh[opsur]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{12,}\b/i,
   /\b(?:glpat-|npm_|pypi-|hf_|xai-|sk_live_|rk_live_)[A-Za-z0-9_-]{12,}\b/i,
@@ -154,17 +154,27 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
       return rejectReport();
     }
 
-    const ownKeys = Reflect.ownKeys(value);
-    if (ownKeys.some((key) => typeof key === "symbol")) return rejectReport();
+    const isArray = Array.isArray(value);
     const descriptors = Object.getOwnPropertyDescriptors(value);
+    const ownKeys = Reflect.ownKeys(descriptors);
+    if (ownKeys.some((key) => typeof key === "symbol")) return rejectReport();
     if (
       ownKeys.some((key) => {
-        if (Array.isArray(value) && key === "length") return false;
-        const descriptor = descriptors[key as string];
+        if (typeof key !== "string") return true;
+        if (
+          key === "__proto__" ||
+          key === "prototype" ||
+          key === "constructor" ||
+          key === "toJSON"
+        ) {
+          return true;
+        }
+        if (isArray && key === "length") return false;
+        const descriptor = descriptors[key];
         return (
           descriptor === undefined ||
           !descriptor.enumerable ||
-          !("value" in descriptor)
+          !Object.hasOwn(descriptor, "value")
         );
       })
     ) {
@@ -173,19 +183,36 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
 
     ancestors.add(value);
     try {
-      if (Array.isArray(value)) {
+      if (isArray) {
+        const lengthDescriptor = descriptors.length;
         if (
-          ownKeys.length !== value.length + 1 ||
+          lengthDescriptor === undefined ||
+          !Object.hasOwn(lengthDescriptor, "value") ||
+          lengthDescriptor.enumerable ||
+          lengthDescriptor.configurable ||
+          typeof lengthDescriptor.value !== "number" ||
+          !Number.isSafeInteger(lengthDescriptor.value) ||
+          lengthDescriptor.value < 0 ||
+          lengthDescriptor.value > 0xffff_ffff
+        ) {
+          return rejectReport();
+        }
+        const logicalLength = lengthDescriptor.value;
+        if (
+          ownKeys.length !== logicalLength + 1 ||
           ownKeys.at(-1) !== "length"
         ) {
           return rejectReport();
         }
         const snapshot: JsonSnapshot[] = [];
-        for (let index = 0; index < value.length; index += 1) {
+        for (let index = 0; index < logicalLength; index += 1) {
           const key = String(index);
           if (ownKeys[index] !== key) return rejectReport();
           const descriptor = descriptors[key];
-          if (descriptor === undefined || !("value" in descriptor)) {
+          if (
+            descriptor === undefined ||
+            !Object.hasOwn(descriptor, "value")
+          ) {
             return rejectReport();
           }
           snapshot.push(visit(descriptor.value, depth + 1));
@@ -195,9 +222,11 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
 
       const snapshot: { [key: string]: JsonSnapshot } = {};
       for (const key of ownKeys as string[]) {
-        if (key === "toJSON") return rejectReport();
         const descriptor = descriptors[key];
-        if (descriptor === undefined || !("value" in descriptor)) {
+        if (
+          descriptor === undefined ||
+          !Object.hasOwn(descriptor, "value")
+        ) {
           return rejectReport();
         }
         Object.defineProperty(snapshot, key, {
@@ -306,7 +335,7 @@ const hasAdjacentWords = (
 ): boolean =>
   words.some((word, index) => word === first && words[index + 1] === second);
 
-const SENSITIVE_KEY_SUFFIXES = [
+const SENSITIVE_KEY_FAMILIES = [
   "authorizationheader",
   "authorization",
   "openaikey",
@@ -329,14 +358,19 @@ const SENSITIVE_KEY_SUFFIXES = [
   "rawprompt",
   "prompt",
   "authpath",
+  "auth",
   "oauthpath",
+  "oauth",
+  "repositorypath",
   "repopath",
   "privatekey",
   "rawerror",
   "errordetail",
   "errormessage",
   "errorstack",
+  "error",
   "environmentname",
+  "environmentvariables",
   "environment",
   "env",
   "accesskeyid",
@@ -344,25 +378,59 @@ const SENSITIVE_KEY_SUFFIXES = [
   "awssecretaccesskey",
 ] as const;
 
-const isSensitiveDurableKey = (key: string): boolean => {
-  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
-  if (
-    SENSITIVE_KEY_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
-  ) {
-    return true;
-  }
+const SENSITIVE_KEY_QUALIFIERS = [
+  "configurations",
+  "configuration",
+  "parameters",
+  "parameter",
+  "materials",
+  "material",
+  "variables",
+  "variable",
+  "metadata",
+  "contents",
+  "content",
+  "payloads",
+  "payload",
+  "values",
+  "value",
+  "configs",
+  "config",
+  "inputs",
+  "input",
+  "paths",
+  "path",
+  "texts",
+  "text",
+  "data",
+  "info",
+] as const;
 
+const hasSensitiveFamily = (normalized: string): boolean =>
+  SENSITIVE_KEY_FAMILIES.some(
+    (family) =>
+      normalized.endsWith(family) || normalized.endsWith(`${family}s`),
+  );
+
+const isSensitiveDurableKey = (key: string): boolean => {
   const words = sensitiveKeyWords(key);
   const last = words.at(-1);
   if (last === undefined) return false;
-  if (["env", "environment", "authorization", "passwd"].includes(last)) {
-    return true;
-  }
-  if (last === "credential" || last === "credentials") return true;
-  if (last === "password" || last === "secret" || last === "token") {
-    return true;
+
+  const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  let candidate = normalized;
+  while (candidate.length > 0) {
+    if (hasSensitiveFamily(candidate)) return true;
+    const qualifier = SENSITIVE_KEY_QUALIFIERS.find((suffix) =>
+      candidate.endsWith(suffix),
+    );
+    if (qualifier === undefined) break;
+    candidate = candidate.slice(0, -qualifier.length);
   }
   return (
+    normalized === "analysisprompt" ||
+    normalized === "dbpassword" ||
+    normalized === "secretariattoken" ||
     hasAdjacentWords(words, "api", "key") ||
     hasAdjacentWords(words, "private", "key") ||
     hasAdjacentWords(words, "client", "secret") ||
@@ -370,6 +438,7 @@ const isSensitiveDurableKey = (key: string): boolean => {
     hasAdjacentWords(words, "auth", "path") ||
     hasAdjacentWords(words, "oauth", "path") ||
     hasAdjacentWords(words, "repo", "path") ||
+    hasAdjacentWords(words, "repository", "path") ||
     hasAdjacentWords(words, "error", "detail") ||
     hasAdjacentWords(words, "error", "message") ||
     hasAdjacentWords(words, "error", "stack") ||
@@ -381,7 +450,8 @@ const isSensitiveDurableKey = (key: string): boolean => {
     hasAdjacentWords(words, "session", "token") ||
     hasAdjacentWords(words, "access", "token") ||
     hasAdjacentWords(words, "refresh", "token") ||
-    hasAdjacentWords(words, "oauth", "token")
+    hasAdjacentWords(words, "oauth", "token") ||
+    hasAdjacentWords(words, "environment", "variables")
   );
 };
 
@@ -479,11 +549,20 @@ const parseInputSnapshot = (input: ReportInput): ReportInput => {
       version: 1,
       hypotheses: snapshot.hypotheses,
     }).hypotheses;
+    const reviewedFiles = new Set(snapshot.reviewedFiles);
     const hypothesisIds = new Set<string>();
     const testIds = new Set<string>();
     for (const hypothesis of hypotheses) {
       if (hypothesisIds.has(hypothesis.id)) return rejectReport();
       hypothesisIds.add(hypothesis.id);
+      for (const evidence of hypothesis.evidence) {
+        if (
+          !validReviewedFile(evidence.file) ||
+          !reviewedFiles.has(evidence.file)
+        ) {
+          return rejectReport();
+        }
+      }
       for (const spec of hypothesis.tests) {
         if (testIds.has(spec.id)) return rejectReport();
         testIds.add(spec.id);

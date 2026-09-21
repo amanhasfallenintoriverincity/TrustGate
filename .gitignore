@@ -27,3 +27,11 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Contest submission documents (local only)
+*.hwp
+*.hwpml
+*_추출.md
+
+# Hermes agent workspace (plans, scratch)
+.hermes/

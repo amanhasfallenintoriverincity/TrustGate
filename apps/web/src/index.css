@@ -1,0 +1,366 @@
+/* TrustGate 실행 증거 대시보드
+   팝업 없이 한 페이지에서 분석 흐름과 판정 근거를 읽습니다.
+   유리 효과는 카드 배경에만 약하게 쓰고, 상태는 색과 아이콘·문구를 함께 표시합니다. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #070c16;
+  --glow-blue: rgba(74, 118, 219, 0.26);
+  --glow-teal: rgba(28, 158, 148, 0.16);
+
+  --surface: rgba(21, 31, 50, 0.62);
+  --card: rgba(30, 43, 67, 0.5);
+  --code-bg: rgba(8, 13, 24, 0.6);
+  --border: rgba(150, 172, 210, 0.22);
+  --border-strong: rgba(150, 172, 210, 0.42);
+
+  --text: #e9f0ff;
+  --text-dim: #a8b7d4;
+  --text-faint: #8695b3;
+
+  --accent: #8ab0ff;
+  --ok: #5cd894;
+  --wait: #eec25f;
+  --danger: #ff9184;
+
+  --radius-lg: 16px;
+  --radius-md: 12px;
+  --radius-sm: 10px;
+  --pill: 999px;
+
+  --space-xs: clamp(6px, 1.2vw, 8px);
+  --space-sm: clamp(8px, 1.6vw, 12px);
+  --space: clamp(12px, 2.4vw, 20px);
+  --space-lg: clamp(18px, 4vw, 32px);
+
+  --font-sans: "Pretendard", "Noto Sans KR", "Apple SD Gothic Neo", system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1100px 560px at 12% -12%, var(--glow-blue), transparent 62%),
+    radial-gradient(820px 480px at 96% 4%, var(--glow-teal), transparent 58%);
+  background-repeat: no-repeat;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.62;
+}
+
+/* 긴 경로·해시·JSON 조각이 좁은 화면을 밀어내지 않도록 줄바꿈을 허용합니다. */
+h1,
+h2,
+h3,
+p,
+li,
+pre,
+code {
+  overflow-wrap: anywhere;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  line-height: 1.32;
+}
+
+p,
+ul {
+  margin: 0;
+}
+
+ul {
+  padding: 0;
+  list-style: none;
+}
+
+.app-shell {
+  display: grid;
+  gap: var(--space);
+  width: 100%;
+  max-inline-size: 1080px;
+  margin-inline: auto;
+  padding: var(--space);
+  padding-block-end: var(--space-lg);
+}
+
+/* 머리말은 카드가 아니므로 유리 효과를 쓰지 않습니다. */
+.app-header {
+  display: grid;
+  gap: var(--space-sm);
+  padding-block: var(--space-sm) var(--space-xs);
+}
+
+.brand {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.headline {
+  font-size: clamp(1.35rem, 5.2vw, 2.1rem);
+  font-weight: 700;
+  text-wrap: balance;
+}
+
+.lede {
+  max-inline-size: 62ch;
+  color: var(--text-dim);
+}
+
+.header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-block-start: var(--space-xs);
+}
+
+.action {
+  min-height: 44px;
+  padding: 10px 22px;
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  border-radius: var(--pill);
+  background-image: linear-gradient(180deg, #a6c6ff, #7099ff);
+  color: #06101f;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.action:hover {
+  background-image: linear-gradient(180deg, #b8d2ff, #82a7ff);
+}
+
+.action:focus-visible {
+  outline: 3px solid #cfe0ff;
+  outline-offset: 2px;
+}
+
+.action-meta {
+  color: var(--text-faint);
+  font-size: 0.88rem;
+}
+
+.action-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-xs);
+  padding: var(--space-sm) var(--space);
+  border: 1px solid var(--border-strong);
+  border-inline-start: 3px solid var(--wait);
+  border-radius: var(--radius-md);
+  background-color: rgba(238, 194, 95, 0.1);
+  color: var(--text-dim);
+  font-size: 0.92rem;
+}
+
+/* 카드 표면: 유리 효과는 여기서만, 그리고 약하게. */
+.surface,
+.card {
+  min-inline-size: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface);
+  -webkit-backdrop-filter: blur(7px) saturate(125%);
+  backdrop-filter: blur(7px) saturate(125%);
+}
+
+.surface {
+  display: grid;
+  gap: var(--space);
+  padding: var(--space);
+}
+
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-xs) var(--space-sm);
+}
+
+.section-head h2 {
+  font-size: 1.06rem;
+}
+
+.section-note,
+.section-foot {
+  max-inline-size: 60ch;
+  color: var(--text-faint);
+  font-size: 0.88rem;
+}
+
+/* 요약 지표 */
+.metric-grid,
+.evidence-grid {
+  display: grid;
+  gap: var(--space-sm);
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+}
+
+.metric {
+  display: grid;
+  gap: 2px;
+  padding: var(--space-sm) var(--space);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--card);
+}
+
+.metric-value {
+  color: var(--accent);
+  font-size: clamp(1.5rem, 6vw, 1.9rem);
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.metric-label {
+  font-weight: 600;
+}
+
+.metric-meta {
+  color: var(--text-faint);
+  font-size: 0.82rem;
+}
+
+/* 분석 흐름: 카드가 섹션의 직접 자식으로 들어가 좁은 화면에서 한 열로 접힙니다. */
+.flow,
+.evidence {
+  grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr));
+}
+
+.flow > .section-head,
+.evidence > .section-head {
+  grid-column: 1 / -1;
+}
+
+.card {
+  display: grid;
+  gap: var(--space-xs);
+  align-content: start;
+  padding: var(--space-sm) var(--space);
+  background-color: var(--card);
+  border-radius: var(--radius-md);
+}
+
+.card-title {
+  font-size: 0.98rem;
+}
+
+.card-body {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+}
+
+.card-meta {
+  color: var(--text-faint);
+  font-size: 0.8rem;
+}
+
+/* 상태 표시: 색과 함께 아이콘과 문구를 항상 붙입니다. */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  justify-self: start;
+  padding: 3px 10px;
+  border: 1px solid currentColor;
+  border-radius: var(--pill);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.status-done {
+  color: var(--ok);
+  background-color: rgba(92, 216, 148, 0.12);
+}
+
+.status-wait {
+  color: var(--wait);
+  background-color: rgba(238, 194, 95, 0.12);
+}
+
+.status-danger {
+  color: var(--danger);
+  background-color: rgba(255, 145, 132, 0.12);
+}
+
+.evidence-body {
+  margin: 0;
+  padding: var(--space-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background-color: var(--code-bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+/* 바닥글: 관리 범위 설명과 제3자 고지를 한곳에 모읍니다. 유리 효과 없음. */
+.app-footer {
+  display: grid;
+  gap: var(--space);
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  padding-block: var(--space-sm) 0;
+  border-block-start: 1px solid var(--border);
+}
+
+.footer-block {
+  display: grid;
+  gap: var(--space-xs);
+  align-content: start;
+  min-inline-size: 0;
+}
+
+.footer-block h2 {
+  font-size: 0.94rem;
+}
+
+.footer-list {
+  display: grid;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 0.88rem;
+}
+
+.footer-notice {
+  color: var(--text-faint);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 420px) {
+  .app-shell {
+    padding-inline: var(--space-sm);
+  }
+
+  .surface {
+    border-radius: var(--radius-md);
+  }
+
+  .header-actions .action {
+    inline-size: 100%;
+  }
+}

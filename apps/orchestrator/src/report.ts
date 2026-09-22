@@ -76,12 +76,18 @@ const PUBLIC_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const RELATIVE_REPO_PATH_PATTERN = /^(?!\/)(?!.*\/\/)[A-Za-z0-9._@+ -]+(?:\/[A-Za-z0-9._@+ -]+)*$/;
 const SENSITIVE_PATH_BASENAME_PATTERN =
   /^(?:auth\.json|credentials\.json|\.env[A-Za-z0-9._-]*|id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key(?:\.[A-Za-z0-9_-]+)?|[^/\\\s"'`]+\.(?:pem|key|p12|pfx))$/i;
+// Repo-relative source filenames keep security-language stems allowed (private-key.ts).
+const SOURCE_FILE_BASENAME_PATTERN =
+  /\.(?:[cm]?[jt]sx?|py|rb|go|rs|java|kt|kts|cs|swift|scala|php|c|cc|cpp|h|hpp|md)$/i;
 const SECRET_FILE_BASENAME_PATTERN =
   /^(?:(?:api[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|oauth[-_]?token|credentials?|password|passwd|secret|client[-_]?secret)(?:\.(?:json|txt|ya?ml|env|ini|conf|config|properties))?|token\.(?:json|txt|ya?ml|env|ini|conf|config|properties))$/i;
 const SENSITIVE_REVIEWED_FILE_BASENAME_PATTERN =
   /^(?:auth\.json|credentials\.json|\.env[A-Za-z0-9._-]*|id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key|[^/\\\s"'`]+\.(?:pem|key|p12|pfx))$/i;
 const SENSITIVE_PATH_TOKEN_PATTERN =
   /(?:^|[/\\])(?:id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key)(?:$|[/\\\s"'`()\[\]{},;<>])/i;
+const DRIVE_LETTER_PATH_PATTERN =
+  /(?:^|[^A-Za-z0-9_.-])[A-Za-z]:[\\/][^\s"'`<>]*/;
+const UNC_PATH_PATTERN = /(?:^|[\s"'`([{=:>,;])\\\\[^\\\s]+\\[^\\\s]+/;
 const SENSITIVE_STRING_PATTERNS = [
   /\braw[-_ ]?(?:(?:system|user|developer)[-_ ]?)?(?:prompt|error)(?:[-_ ]?(?:detail|message|stack))?(?:[-_ ]?marker)?\b/i,
   /\bauthorization\s*[:=]\s*\S+/i,
@@ -102,8 +108,8 @@ const SENSITIVE_STRING_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
   /(?:^|[^A-Za-z0-9_.-])~\/(?:\.ssh|\.aws|\.config|\.codex)\/(?:[^\s"'`<>]*)/i,
   /(?:^|[^A-Za-z0-9_.-])(?:HOME|USERPROFILE)\s*\/\s*(?:\.ssh|\.aws|\.config|\.codex)\/(?:[^\s"'`<>]*)/i,
-  /(?:^|[^A-Za-z0-9_.-])[A-Za-z]:[\\/][^\s"'`<>]*/,
-  /(?:^|[\s"'`([{=:>,;])\\\\[^\\\s]+\\[^\\\s]+/,
+  DRIVE_LETTER_PATH_PATTERN,
+  UNC_PATH_PATTERN,
 ] as const;
 // Contract schemas cap JSON at depth 8, while report wrappers add at most eight levels.
 const MAX_REPORT_JSON_DEPTH = JSON_MAX_DEPTH + 8;
@@ -224,8 +230,14 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
     }
 
     if (isArray) {
-      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+      // Capture once: a single ownKeys pass with one descriptor read per key.
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const ownKeys = Reflect.ownKeys(descriptors);
+      const lengthDescriptor = (
+        descriptors as Record<string, PropertyDescriptor | undefined>
+      )["length"];
       if (
+        ownKeys.some((key) => typeof key === "symbol") ||
         lengthDescriptor === undefined ||
         !Object.hasOwn(lengthDescriptor, "value") ||
         lengthDescriptor.enumerable ||
@@ -239,13 +251,7 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
       }
       const logicalLength = lengthDescriptor.value;
       if (logicalLength > maxContainerEntries(context)) return rejectReport();
-      const descriptors = Object.getOwnPropertyDescriptors(value);
-      const ownKeys = Reflect.ownKeys(descriptors);
-      if (
-        ownKeys.some((key) => typeof key === "symbol") ||
-        ownKeys.length !== logicalLength + 1 ||
-        ownKeys.at(-1) !== "length"
-      ) {
+      if (ownKeys.length !== logicalLength + 1 || ownKeys.at(-1) !== "length") {
         return rejectReport();
       }
       accountBytes(2 + Math.max(0, logicalLength - 1));
@@ -369,10 +375,12 @@ const hasExactOwnKeys = (
 const containsSensitivePathBasename = (value: string): boolean =>
   value.split(/[/\\]/).some((segment) => {
     const basename = segment.match(/^[^\s"'`()\[\]{},;<>]+/)?.[0];
+    if (basename === undefined || !basename.includes(".")) return false;
+    // Repo-relative source filenames such as private-key.ts stay allowed.
+    if (SOURCE_FILE_BASENAME_PATTERN.test(basename)) return false;
     return (
-      basename !== undefined &&
-      basename.includes(".") &&
-      SENSITIVE_PATH_BASENAME_PATTERN.test(basename)
+      SENSITIVE_PATH_BASENAME_PATTERN.test(basename) ||
+      SECRET_FILE_BASENAME_PATTERN.test(basename)
     );
   });
 
@@ -385,8 +393,14 @@ const hasAbsolutePosixHostPath = (value: string): boolean => {
   });
 };
 
+// Host filesystem locations: POSIX absolutes, drive-letter paths and UNC shares.
+const containsHostPath = (value: string): boolean =>
+  hasAbsolutePosixHostPath(value) ||
+  DRIVE_LETTER_PATH_PATTERN.test(value) ||
+  UNC_PATH_PATTERN.test(value);
+
 const containsSensitiveString = (value: string): boolean => {
-  if (hasAbsolutePosixHostPath(value)) return true;
+  if (containsHostPath(value)) return true;
   if (SENSITIVE_PATH_TOKEN_PATTERN.test(value)) return true;
   if (containsSensitivePathBasename(value)) return true;
   for (const pattern of SENSITIVE_STRING_PATTERNS) {
@@ -443,6 +457,7 @@ const SENSITIVE_KEY_WORDS = new Set([
   "secret",
   "credential",
   "prompt",
+  "token",
   "environment",
   "env",
   "error",
@@ -459,6 +474,7 @@ const SENSITIVE_COMPACT_KEY_FAMILIES = [
   "clientsecret",
   "privatekey",
   "apikey",
+  "token",
   "rawerror",
   "rawprompt",
   "repositorypath",
@@ -483,19 +499,46 @@ const SAFE_COMPACT_KEY_FAMILIES = [
 const pluralStem = (word: string): string =>
   word.endsWith("s") && word !== "access" ? word.slice(0, -1) : word;
 
+// Family stems that stay sensitive everywhere except inside these exact sequences.
+const SAFE_KEY_SEQUENCES: readonly (readonly string[])[] = [
+  ["token", "count"],
+  ["standard", "error"],
+];
+
+const hasSequenceAt = (
+  words: readonly string[],
+  index: number,
+  sequence: readonly string[],
+): boolean => sequence.every((word, offset) => words[index + offset] === word);
+
+const withoutSafeKeySequences = (words: readonly string[]): string[] => {
+  const remaining = [...words];
+  for (const sequence of SAFE_KEY_SEQUENCES) {
+    for (
+      let index = 0;
+      index <= remaining.length - sequence.length;
+      index += 1
+    ) {
+      if (!hasSequenceAt(remaining, index, sequence)) continue;
+      remaining.splice(index, sequence.length);
+      index = -1;
+    }
+  }
+  return remaining;
+};
+
 const hasWordSequence = (
   words: readonly string[],
   sequence: readonly string[],
 ): boolean =>
-  words.some((_, index) =>
-    sequence.every((word, offset) => words[index + offset] === word),
-  );
+  words.some((_, index) => hasSequenceAt(words, index, sequence));
 
 const isSensitiveDurableKey = (key: string): boolean => {
-  if (hasAbsolutePosixHostPath(key)) return true;
-  const words = sensitiveKeyWords(key).map(pluralStem);
+  if (containsHostPath(key)) return true;
+  if (containsSensitivePathBasename(key)) return true;
+  const words = withoutSafeKeySequences(sensitiveKeyWords(key).map(pluralStem));
+  if (words.length === 0) return false;
   if (words.some((word) => SENSITIVE_KEY_WORDS.has(word))) return true;
-  if (hasWordSequence(words, ["token", "count"])) return false;
 
   const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
   const compact = SAFE_COMPACT_KEY_FAMILIES.reduce(
@@ -504,11 +547,9 @@ const isSensitiveDurableKey = (key: string): boolean => {
   );
   return (
     SENSITIVE_COMPACT_KEY_FAMILIES.some((family) => compact.includes(family)) ||
-    /(?:^|[^a-z0-9])tokens?(?:[^a-z0-9]|$)/i.test(key) ||
     hasWordSequence(words, ["api", "key"]) ||
     hasWordSequence(words, ["access", "key"]) ||
     hasWordSequence(words, ["private", "key"]) ||
-    hasWordSequence(words, ["raw", "error"]) ||
     hasWordSequence(words, ["repo", "path"]) ||
     hasWordSequence(words, ["repository", "path"])
   );
@@ -583,7 +624,6 @@ const parseInputSnapshot = (input: ReportInput): ReportInput => {
       return rejectReport();
     }
     if (containsSensitiveDurableValue(snapshotValue)) {
-      console.error("SENSITIVE_REJECT");
       return rejectReport();
     }
     const snapshot = snapshotValue as unknown as ReportInput;

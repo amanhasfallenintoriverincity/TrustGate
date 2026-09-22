@@ -928,23 +928,26 @@ test("report snapshots object proxy keys and descriptors exactly once", () => {
   );
 });
 
-test("report snapshots an array without reading property values", () => {
+test("report snapshots array proxy keys descriptors and length exactly once", () => {
   const input = makeInput();
   let ownKeyReads = 0;
-  let descriptorReads = 0;
-  let valueReads = 0;
+  const descriptorReads = new Map<PropertyKey, number>();
+  let lengthValueReads = 0;
   const target = ["first", "second"];
   const value = new Proxy(target, {
     ownKeys(current) {
       ownKeyReads += 1;
+      if (ownKeyReads > 1) throw new Error("array own keys observed twice");
       return Reflect.ownKeys(current);
     },
     getOwnPropertyDescriptor(current, key) {
-      descriptorReads += 1;
+      const reads = (descriptorReads.get(key) ?? 0) + 1;
+      descriptorReads.set(key, reads);
+      if (reads > 1) throw new Error(`array descriptor observed twice: ${String(key)}`);
       return Reflect.getOwnPropertyDescriptor(current, key);
     },
     get(current, key, receiver) {
-      valueReads += 1;
+      if (key === "length") lengthValueReads += 1;
       return Reflect.get(current, key, receiver);
     },
   });
@@ -956,9 +959,22 @@ test("report snapshots an array without reading property values", () => {
     "first",
     "second",
   ]);
-  assert.equal(ownKeyReads, 1);
-  assert.equal(descriptorReads, 4);
-  assert.equal(valueReads, 0);
+  assert.deepEqual(
+    {
+      ownKeyReads,
+      zeroDescriptorReads: descriptorReads.get("0"),
+      oneDescriptorReads: descriptorReads.get("1"),
+      lengthDescriptorReads: descriptorReads.get("length"),
+      lengthValueReads,
+    },
+    {
+      ownKeyReads: 1,
+      zeroDescriptorReads: 1,
+      oneDescriptorReads: 1,
+      lengthDescriptorReads: 1,
+      lengthValueReads: 0,
+    },
+  );
 });
 
 test("report rejects proxy descriptor trap errors generically", () => {

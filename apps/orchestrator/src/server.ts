@@ -9,7 +9,10 @@
  * Leak posture: responses and logs never carry credentials, prompts, request bodies, or
  * raw host paths. Errors are fixed generic strings, log records are a closed union of
  * non-sensitive metadata fields, and Fastify's own logger stays disabled because it
- * captures raw request headers (including `authorization`).
+ * captures raw request headers (including `authorization`). On top of that, every record
+ * handed to a log sink passes through the central redaction layer (`redaction.ts`), which
+ * is wired once at the sink in `buildServer` — a value that still reaches a field is
+ * removed before any sink can observe it.
  */
 import { randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
@@ -37,6 +40,7 @@ import Fastify, {
 import { collectDiffs, type FileDiff } from "./diff-collector.js";
 import { createOcrAdapter, type ReviewInput } from "./ocr-adapter.js";
 import { createSecurityPlanner, type PlannerInput } from "./planner.js";
+import { createRedactingSink } from "./redaction.js";
 import {
   createRunReport,
   type ReportDurations,
@@ -536,7 +540,9 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
   // check below refuses it. A root that cannot be pinned admits nothing at all: failing closed
   // keeps a mistyped or missing root from being redefined by whoever controls its parent.
   const rootIdentity = pinRootIdentity(rootDir);
-  const log = options.log;
+  // The one place this server hands records to a log sink: wrap the caller's sink once, here, so
+  // no code path — present or future — can write an unredacted record to it.
+  const log = options.log === undefined ? undefined : createRedactingSink(options.log);
   const createWorkspacePipeline =
     options.createWorkspacePipeline ?? createDefaultWorkspacePipeline;
   const executeRun =

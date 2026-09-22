@@ -11,10 +11,16 @@
  * listen failures emit a fixed `{"event":"server.failed","reason":...}` record: never a stack
  * trace, a host path, or a framework message. Shutdown stops accepting work, gives in-flight
  * runs `SHUTDOWN_GRACE_MS` to finish, then forces the exit with a matching log record.
+ *
+ * Every line passes through the central redaction layer in `redaction.ts` on its way to stdout —
+ * the one place the process emits output — so a credential that reaches a record field is
+ * removed before it is written. A record that cannot be serialized or redacted is replaced by
+ * `REDACTION_FAILURE_LINE`, never written raw and never dropped silently.
  */
 import { realpathSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { serializeLogLine } from "./redaction.js";
 import { buildServer, type RunLogRecord, type ServerMode } from "./server.js";
 
 const DEFAULT_PORT = 8787;
@@ -80,12 +86,14 @@ const guardStdoutErrors = (): void => {
 };
 
 /**
- * Writes one JSON line. `writeSync` keeps the record intact when the process exits immediately
- * afterwards: buffered pipe output would otherwise be dropped on a forced shutdown. Both writes
- * are best-effort — if the stream is gone, the record is lost and the process carries on.
+ * Writes one JSON line. The record is serialized and redacted first (`serializeLogLine`), so raw
+ * field values can never reach the stream. `writeSync` keeps the line intact when the process
+ * exits immediately afterwards: buffered pipe output would otherwise be dropped on a forced
+ * shutdown. Both writes are best-effort — if the stream is gone, the line is lost and the process
+ * carries on.
  */
 export const writeLog = (record: ServerLogRecord | RunLogRecord): void => {
-  const line = `${JSON.stringify(record)}\n`;
+  const line = serializeLogLine(record);
   guardStdoutErrors();
   try {
     writeSync(process.stdout.fd, line);

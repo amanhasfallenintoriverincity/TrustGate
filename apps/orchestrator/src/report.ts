@@ -3,7 +3,10 @@ import { Buffer } from "node:buffer";
 import {
   analysisPlanSchema,
   executionResultSchema,
+  JSON_MAX_ARRAY_LENGTH,
   JSON_MAX_DEPTH,
+  JSON_MAX_RECORD_KEYS,
+  JSON_MAX_STRING_LENGTH,
   type AnalysisPlan,
   type ExecutionResult,
 } from "@trustgate/contracts";
@@ -72,9 +75,13 @@ type ExpectedIdentity = {
 const PUBLIC_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const RELATIVE_REPO_PATH_PATTERN = /^(?!\/)(?!.*\/\/)[A-Za-z0-9._@+ -]+(?:\/[A-Za-z0-9._@+ -]+)*$/;
 const SENSITIVE_PATH_BASENAME_PATTERN =
-  /^(?:auth\.json|\.env[A-Za-z0-9._-]*|id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key(?:\.[A-Za-z0-9_-]+)?|[^/\\\s"'`]+\.(?:pem|key|p12|pfx))$/i;
+  /^(?:auth\.json|credentials\.json|\.env[A-Za-z0-9._-]*|id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key(?:\.[A-Za-z0-9_-]+)?|[^/\\\s"'`]+\.(?:pem|key|p12|pfx))$/i;
 const SECRET_FILE_BASENAME_PATTERN =
   /^(?:(?:api[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|oauth[-_]?token|credentials?|password|passwd|secret|client[-_]?secret)(?:\.(?:json|txt|ya?ml|env|ini|conf|config|properties))?|token\.(?:json|txt|ya?ml|env|ini|conf|config|properties))$/i;
+const SENSITIVE_REVIEWED_FILE_BASENAME_PATTERN =
+  /^(?:auth\.json|credentials\.json|\.env[A-Za-z0-9._-]*|id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key|[^/\\\s"'`]+\.(?:pem|key|p12|pfx))$/i;
+const SENSITIVE_PATH_TOKEN_PATTERN =
+  /(?:^|[/\\])(?:id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key)(?:$|[/\\\s"'`()\[\]{},;<>])/i;
 const SENSITIVE_STRING_PATTERNS = [
   /\braw[-_ ]?(?:(?:system|user|developer)[-_ ]?)?(?:prompt|error)(?:[-_ ]?(?:detail|message|stack))?(?:[-_ ]?marker)?\b/i,
   /\bauthorization\s*[:=]\s*\S+/i,
@@ -93,7 +100,6 @@ const SENSITIVE_STRING_PATTERNS = [
   /\bAIza[0-9A-Za-z_-]{30,}\b/,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,
-  /(?:^|[^A-Za-z0-9_./~-])\/(?:home|Users|root|tmp|var|opt|etc)\/(?:[^\s"'`<>]*)/i,
   /(?:^|[^A-Za-z0-9_.-])~\/(?:\.ssh|\.aws|\.config|\.codex)\/(?:[^\s"'`<>]*)/i,
   /(?:^|[^A-Za-z0-9_.-])(?:HOME|USERPROFILE)\s*\/\s*(?:\.ssh|\.aws|\.config|\.codex)\/(?:[^\s"'`<>]*)/i,
   /(?:^|[^A-Za-z0-9_.-])[A-Za-z]:[\\/][^\s"'`<>]*/,
@@ -103,6 +109,7 @@ const SENSITIVE_STRING_PATTERNS = [
 const MAX_REPORT_JSON_DEPTH = JSON_MAX_DEPTH + 8;
 // Every JSON node consumes at least one byte inside the existing report byte cap.
 const MAX_REPORT_JSON_NODES = REPORT_MAX_BYTES;
+const MAX_REPORT_WRAPPER_ENTRIES = 64;
 const DURATION_KEYS = [
   "totalMs",
   "ocrMs",
@@ -129,35 +136,150 @@ const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   !Array.isArray(value) &&
   Object.getPrototypeOf(value) === Object.prototype;
 
+type SnapshotContext = {
+  arrayLimit?: number;
+  jsonValue: boolean;
+};
+
+const childSnapshotContext = (
+  key: string,
+  parentIsJsonValue: boolean,
+): SnapshotContext => {
+  if (key === "vulnerableResults" || key === "patchedResults") {
+    return { arrayLimit: 50, jsonValue: false };
+  }
+  if (key === "reviewedFiles" || key === "hypotheses") {
+    return { arrayLimit: MAX_REPORT_WRAPPER_ENTRIES, jsonValue: false };
+  }
+  if (key === "evidence" || key === "tests" || key === "assertions") {
+    return { arrayLimit: MAX_REPORT_WRAPPER_ENTRIES, jsonValue: false };
+  }
+  if (
+    parentIsJsonValue ||
+    key === "body" ||
+    key === "expected" ||
+    key === "actual" ||
+    key === "equals"
+  ) {
+    return { jsonValue: true };
+  }
+  return { jsonValue: false };
+};
+
+const maxContainerEntries = (context: SnapshotContext): number =>
+  context.arrayLimit ??
+  (context.jsonValue ? JSON_MAX_ARRAY_LENGTH : MAX_REPORT_WRAPPER_ENTRIES);
+
 const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
   const ancestors = new Set<object>();
   let visited = 0;
+  let accountedBytes = 0;
 
-  const visit = (value: unknown, depth: number): JsonSnapshot => {
+  const accountBytes = (bytes: number): void => {
+    accountedBytes += bytes;
+    if (accountedBytes > REPORT_MAX_BYTES) return rejectReport();
+  };
+
+  const visit = (
+    value: unknown,
+    depth: number,
+    context: SnapshotContext,
+  ): JsonSnapshot => {
     visited += 1;
     if (visited > MAX_REPORT_JSON_NODES || depth > MAX_REPORT_JSON_DEPTH) {
       return rejectReport();
     }
-    if (value === null || typeof value === "string" || typeof value === "boolean") {
+    if (value === null) {
+      accountBytes(4);
+      return value;
+    }
+    if (typeof value === "string") {
+      if (
+        context.jsonValue &&
+        value.length > JSON_MAX_STRING_LENGTH
+      ) {
+        return rejectReport();
+      }
+      accountBytes(Buffer.byteLength(value, "utf8") + 2);
+      return value;
+    }
+    if (typeof value === "boolean") {
+      accountBytes(value ? 4 : 5);
       return value;
     }
     if (typeof value === "number") {
-      return Number.isFinite(value) ? value : rejectReport();
+      if (!Number.isFinite(value)) return rejectReport();
+      accountBytes(String(value).length);
+      return value;
     }
     if (typeof value !== "object") return rejectReport();
     if (ancestors.has(value)) return rejectReport();
 
     const prototype = Object.getPrototypeOf(value);
-    if (Array.isArray(value)) {
+    const isArray = Array.isArray(value);
+    if (isArray) {
       if (prototype !== Array.prototype) return rejectReport();
     } else if (prototype !== Object.prototype) {
       return rejectReport();
     }
 
-    const isArray = Array.isArray(value);
+    if (isArray) {
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+      if (
+        lengthDescriptor === undefined ||
+        !Object.hasOwn(lengthDescriptor, "value") ||
+        lengthDescriptor.enumerable ||
+        lengthDescriptor.configurable ||
+        typeof lengthDescriptor.value !== "number" ||
+        !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0 ||
+        lengthDescriptor.value > 0xffff_ffff
+      ) {
+        return rejectReport();
+      }
+      const logicalLength = lengthDescriptor.value;
+      if (logicalLength > maxContainerEntries(context)) return rejectReport();
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const ownKeys = Reflect.ownKeys(descriptors);
+      if (
+        ownKeys.some((key) => typeof key === "symbol") ||
+        ownKeys.length !== logicalLength + 1 ||
+        ownKeys.at(-1) !== "length"
+      ) {
+        return rejectReport();
+      }
+      accountBytes(2 + Math.max(0, logicalLength - 1));
+      ancestors.add(value);
+      try {
+        const snapshot: JsonSnapshot[] = [];
+        for (let index = 0; index < logicalLength; index += 1) {
+          const key = String(index);
+          if (ownKeys[index] !== key) return rejectReport();
+          const descriptor = descriptors[key];
+          if (
+            descriptor === undefined ||
+            !descriptor.enumerable ||
+            !Object.hasOwn(descriptor, "value")
+          ) {
+            return rejectReport();
+          }
+          snapshot.push(visit(descriptor.value, depth + 1, context));
+        }
+        return snapshot;
+      } finally {
+        ancestors.delete(value);
+      }
+    }
+
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const ownKeys = Reflect.ownKeys(descriptors);
     if (ownKeys.some((key) => typeof key === "symbol")) return rejectReport();
+    if (
+      ownKeys.length >
+      (context.jsonValue ? JSON_MAX_RECORD_KEYS : MAX_REPORT_WRAPPER_ENTRIES)
+    ) {
+      return rejectReport();
+    }
     if (
       ownKeys.some((key) => {
         if (typeof key !== "string") return true;
@@ -169,7 +291,6 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
         ) {
           return true;
         }
-        if (isArray && key === "length") return false;
         const descriptor = descriptors[key];
         return (
           descriptor === undefined ||
@@ -181,45 +302,9 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
       return rejectReport();
     }
 
+    accountBytes(2 + Math.max(0, ownKeys.length - 1));
     ancestors.add(value);
     try {
-      if (isArray) {
-        const lengthDescriptor = descriptors.length;
-        if (
-          lengthDescriptor === undefined ||
-          !Object.hasOwn(lengthDescriptor, "value") ||
-          lengthDescriptor.enumerable ||
-          lengthDescriptor.configurable ||
-          typeof lengthDescriptor.value !== "number" ||
-          !Number.isSafeInteger(lengthDescriptor.value) ||
-          lengthDescriptor.value < 0 ||
-          lengthDescriptor.value > 0xffff_ffff
-        ) {
-          return rejectReport();
-        }
-        const logicalLength = lengthDescriptor.value;
-        if (
-          ownKeys.length !== logicalLength + 1 ||
-          ownKeys.at(-1) !== "length"
-        ) {
-          return rejectReport();
-        }
-        const snapshot: JsonSnapshot[] = [];
-        for (let index = 0; index < logicalLength; index += 1) {
-          const key = String(index);
-          if (ownKeys[index] !== key) return rejectReport();
-          const descriptor = descriptors[key];
-          if (
-            descriptor === undefined ||
-            !Object.hasOwn(descriptor, "value")
-          ) {
-            return rejectReport();
-          }
-          snapshot.push(visit(descriptor.value, depth + 1));
-        }
-        return snapshot;
-      }
-
       const snapshot: { [key: string]: JsonSnapshot } = {};
       for (const key of ownKeys as string[]) {
         const descriptor = descriptors[key];
@@ -229,11 +314,19 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
         ) {
           return rejectReport();
         }
+        if (context.jsonValue && key.length > 256) {
+          return rejectReport();
+        }
+        accountBytes(Buffer.byteLength(key, "utf8") + 3);
         Object.defineProperty(snapshot, key, {
           configurable: true,
           enumerable: true,
           writable: true,
-          value: visit(descriptor.value, depth + 1),
+          value: visit(
+            descriptor.value,
+            depth + 1,
+            childSnapshotContext(key, context.jsonValue),
+          ),
         });
       }
       return snapshot;
@@ -242,7 +335,7 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
     }
   };
 
-  return visit(root, 0);
+  return visit(root, 0, { jsonValue: false });
 };
 
 const cloneJson = <Value>(value: Value): Value =>
@@ -277,11 +370,24 @@ const containsSensitivePathBasename = (value: string): boolean =>
   value.split(/[/\\]/).some((segment) => {
     const basename = segment.match(/^[^\s"'`()\[\]{},;<>]+/)?.[0];
     return (
-      basename !== undefined && SENSITIVE_PATH_BASENAME_PATTERN.test(basename)
+      basename !== undefined &&
+      basename.includes(".") &&
+      SENSITIVE_PATH_BASENAME_PATTERN.test(basename)
     );
   });
 
+const hasAbsolutePosixHostPath = (value: string): boolean => {
+  const pathTokens = value.match(/(?:^|[\s"'`([{=:>,;])\/{1,2}[^\s"'`<>]*/g);
+  if (pathTokens === null) return false;
+  return pathTokens.some((token) => {
+    const path = token.trimStart();
+    return !path.startsWith("/api/");
+  });
+};
+
 const containsSensitiveString = (value: string): boolean => {
+  if (hasAbsolutePosixHostPath(value)) return true;
+  if (SENSITIVE_PATH_TOKEN_PATTERN.test(value)) return true;
   if (containsSensitivePathBasename(value)) return true;
   for (const pattern of SENSITIVE_STRING_PATTERNS) {
     pattern.lastIndex = 0;
@@ -316,7 +422,7 @@ const validReviewedFile = (value: unknown): value is string => {
   const baseName = segments.at(-1)!;
   return (
     !SECRET_FILE_BASENAME_PATTERN.test(baseName) &&
-    !SENSITIVE_PATH_BASENAME_PATTERN.test(baseName)
+    !SENSITIVE_REVIEWED_FILE_BASENAME_PATTERN.test(baseName)
   );
 };
 
@@ -328,130 +434,83 @@ const sensitiveKeyWords = (key: string): string[] =>
     .filter((word) => word.length > 0)
     .map((word) => word.toLowerCase());
 
-const hasAdjacentWords = (
-  words: readonly string[],
-  first: string,
-  second: string,
-): boolean =>
-  words.some((word, index) => word === first && words[index + 1] === second);
-
-const SENSITIVE_KEY_FAMILIES = [
-  "authorizationheader",
+const SENSITIVE_KEY_WORDS = new Set([
   "authorization",
-  "openaikey",
-  "apikey",
+  "auth",
+  "oauth",
+  "password",
+  "passwd",
+  "secret",
+  "credential",
+  "prompt",
+  "environment",
+  "env",
+  "error",
+]);
+
+const SENSITIVE_COMPACT_KEY_FAMILIES = [
+  "accesskey",
+  "authorization",
   "accesstoken",
   "refreshtoken",
   "sessiontoken",
   "oauthtoken",
   "githubtoken",
-  "token",
   "clientsecret",
-  "secret",
-  "credentials",
-  "credential",
-  "password",
-  "passwd",
-  "developerprompt",
-  "systemprompt",
-  "userprompt",
+  "privatekey",
+  "apikey",
+  "rawerror",
   "rawprompt",
-  "prompt",
-  "authpath",
-  "auth",
-  "oauthpath",
-  "oauth",
   "repositorypath",
   "repopath",
-  "privatekey",
-  "rawerror",
-  "errordetail",
-  "errormessage",
-  "errorstack",
-  "error",
-  "environmentname",
-  "environmentvariables",
   "environment",
-  "env",
-  "accesskeyid",
-  "secretaccesskey",
-  "awssecretaccesskey",
+  "credential",
+  "password",
+  "prompt",
+  "secret",
+  "error",
 ] as const;
 
-const SENSITIVE_KEY_QUALIFIERS = [
-  "configurations",
-  "configuration",
-  "parameters",
-  "parameter",
-  "materials",
-  "material",
-  "variables",
-  "variable",
-  "metadata",
-  "contents",
-  "content",
-  "payloads",
-  "payload",
-  "values",
-  "value",
-  "configs",
-  "config",
-  "inputs",
-  "input",
-  "paths",
-  "path",
-  "texts",
-  "text",
-  "data",
-  "info",
+const SAFE_COMPACT_KEY_FAMILIES = [
+  "tokenizer",
+  "passwordless",
+  "credentialing",
+  "secretariat",
+  "standarderror",
+  "environmental",
 ] as const;
 
-const hasSensitiveFamily = (normalized: string): boolean =>
-  SENSITIVE_KEY_FAMILIES.some(
-    (family) =>
-      normalized.endsWith(family) || normalized.endsWith(`${family}s`),
+const pluralStem = (word: string): string =>
+  word.endsWith("s") && word !== "access" ? word.slice(0, -1) : word;
+
+const hasWordSequence = (
+  words: readonly string[],
+  sequence: readonly string[],
+): boolean =>
+  words.some((_, index) =>
+    sequence.every((word, offset) => words[index + offset] === word),
   );
 
 const isSensitiveDurableKey = (key: string): boolean => {
-  const words = sensitiveKeyWords(key);
-  const last = words.at(-1);
-  if (last === undefined) return false;
+  if (hasAbsolutePosixHostPath(key)) return true;
+  const words = sensitiveKeyWords(key).map(pluralStem);
+  if (words.some((word) => SENSITIVE_KEY_WORDS.has(word))) return true;
+  if (hasWordSequence(words, ["token", "count"])) return false;
 
   const normalized = key.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
-  let candidate = normalized;
-  while (candidate.length > 0) {
-    if (hasSensitiveFamily(candidate)) return true;
-    const qualifier = SENSITIVE_KEY_QUALIFIERS.find((suffix) =>
-      candidate.endsWith(suffix),
-    );
-    if (qualifier === undefined) break;
-    candidate = candidate.slice(0, -qualifier.length);
-  }
+  const compact = SAFE_COMPACT_KEY_FAMILIES.reduce(
+    (candidate, family) => candidate.replaceAll(family, ""),
+    normalized,
+  );
   return (
-    normalized === "analysisprompt" ||
-    normalized === "dbpassword" ||
-    normalized === "secretariattoken" ||
-    hasAdjacentWords(words, "api", "key") ||
-    hasAdjacentWords(words, "private", "key") ||
-    hasAdjacentWords(words, "client", "secret") ||
-    hasAdjacentWords(words, "authorization", "header") ||
-    hasAdjacentWords(words, "auth", "path") ||
-    hasAdjacentWords(words, "oauth", "path") ||
-    hasAdjacentWords(words, "repo", "path") ||
-    hasAdjacentWords(words, "repository", "path") ||
-    hasAdjacentWords(words, "error", "detail") ||
-    hasAdjacentWords(words, "error", "message") ||
-    hasAdjacentWords(words, "error", "stack") ||
-    hasAdjacentWords(words, "raw", "prompt") ||
-    hasAdjacentWords(words, "raw", "error") ||
-    hasAdjacentWords(words, "system", "prompt") ||
-    hasAdjacentWords(words, "user", "prompt") ||
-    hasAdjacentWords(words, "developer", "prompt") ||
-    hasAdjacentWords(words, "session", "token") ||
-    hasAdjacentWords(words, "access", "token") ||
-    hasAdjacentWords(words, "refresh", "token") ||
-    hasAdjacentWords(words, "oauth", "token") ||
-    hasAdjacentWords(words, "environment", "variables")
+    SENSITIVE_COMPACT_KEY_FAMILIES.some((family) => compact.includes(family)) ||
+    /(?:^|[^a-z0-9])tokens?(?:[^a-z0-9]|$)/i.test(key) ||
+    hasWordSequence(words, ["api", "key"]) ||
+    hasWordSequence(words, ["access", "key"]) ||
+    hasWordSequence(words, ["private", "key"]) ||
+    hasWordSequence(words, ["raw", "error"]) ||
+    hasWordSequence(words, ["repo", "path"]) ||
+    hasWordSequence(words, ["repository", "path"])
   );
 };
 
@@ -524,6 +583,7 @@ const parseInputSnapshot = (input: ReportInput): ReportInput => {
       return rejectReport();
     }
     if (containsSensitiveDurableValue(snapshotValue)) {
+      console.error("SENSITIVE_REJECT");
       return rejectReport();
     }
     const snapshot = snapshotValue as unknown as ReportInput;

@@ -102,6 +102,30 @@ const setRequestBody = (input: ReportInput, value: unknown): void => {
   request.body = value;
 };
 
+const countDescriptorObservations = (
+  target: object,
+  action: () => void,
+): number => {
+  const originalAll = Object.getOwnPropertyDescriptors;
+  const originalOne = Object.getOwnPropertyDescriptor;
+  let observations = 0;
+  Object.getOwnPropertyDescriptors = ((value: object) => {
+    if (value === target) observations += 1;
+    return originalAll(value);
+  }) as typeof Object.getOwnPropertyDescriptors;
+  Object.getOwnPropertyDescriptor = ((value: object, key: PropertyKey) => {
+    if (value === target) observations += 1;
+    return originalOne(value, key);
+  }) as typeof Object.getOwnPropertyDescriptor;
+  try {
+    action();
+  } finally {
+    Object.getOwnPropertyDescriptors = originalAll;
+    Object.getOwnPropertyDescriptor = originalOne;
+  }
+  return observations;
+};
+
 test("report joins results into hypotheses and exposes fixed regressions", () => {
   const report = createRunReport(makeInput());
   const hypothesis = report.hypotheses[0];
@@ -585,18 +609,20 @@ test("report preserves safe security language and valid API paths", () => {
 test("report accepts safe source filenames that contain security-language stems", () => {
   const input = makeInput();
   input.reviewedFiles = [
+    "src/private-key.ts",
     "src/passwordless.ts",
     "src/credentialing.ts",
     "src/token.ts",
     "src/authorization.ts",
   ];
-  input.hypotheses[0]!.evidence[0]!.file = "src/passwordless.ts";
+  input.hypotheses[0]!.evidence[0]!.file = "src/private-key.ts";
   input.hypotheses[0]!.tests[0]!.request.body = {
     tokenCount: 1,
     tokenizer: "public",
     passwordless: true,
     credentialing: "training",
     secretariat: "office",
+    standardError: "documented status",
     tokenizerData: "public",
     passwordlessConfig: "enabled",
     credentialingMaterial: "training",
@@ -615,6 +641,8 @@ test("report accepts safe near-words outside sensitive-key families", () => {
     passwordless: true,
     credentialing: "training",
     secretariat: "office",
+    standardError: "documented status",
+    environmentalImpact: "low",
   };
 
   assert.equal(createRunReport(input).regressionVerdict, "FIXED");
@@ -638,6 +666,55 @@ test("report rejects sensitive family suffix keys", () => {
 
     assert.equal(rejectionMessage(input), "run report rejected", key);
   }
+});
+
+test("report rejects a sensitive family token before a safe suffix", () => {
+  const input = makeInput();
+  input.hypotheses[0]!.tests[0]!.request.body = {
+    passwordBackup: "opaque-value",
+  };
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+});
+
+test("report rejects a host absolute path used as an object key", () => {
+  const input = makeInput();
+  input.hypotheses[0]!.tests[0]!.request.body = {
+    "/home/user/private/repo/file.ts": "public-example",
+  };
+
+  assert.equal(rejectionMessage(input), "run report rejected");
+});
+
+const uncoveredAbsoluteHostPaths = [
+  "/srv/project/private",
+  "/usr/local/private",
+  "/workspace/project",
+  "/mnt/data",
+  "/run/secrets",
+  "/dev/shm",
+  "/proc/self/environ",
+  "/boot/config",
+  "/",
+  "//server/share",
+] as const;
+
+for (const path of uncoveredAbsoluteHostPaths) {
+  test(`report rejects every absolute POSIX host path: ${path}`, () => {
+    const input = makeInput();
+    input.hypotheses[0]!.tests[0]!.request.body = { note: path };
+
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+}
+
+test("report rejects a credentials file value", () => {
+  const input = makeInput();
+  input.hypotheses[0]!.tests[0]!.request.body = {
+    note: "config/credentials.json",
+  };
+
+  assert.equal(rejectionMessage(input), "run report rejected");
 });
 
 const jsonOriginViolations: ReadonlyArray<readonly [string, () => unknown]> = [
@@ -851,26 +928,23 @@ test("report snapshots object proxy keys and descriptors exactly once", () => {
   );
 });
 
-test("report snapshots array proxy keys descriptors and length exactly once", () => {
+test("report snapshots an array without reading property values", () => {
   const input = makeInput();
   let ownKeyReads = 0;
-  const descriptorReads = new Map<PropertyKey, number>();
-  let lengthValueReads = 0;
+  let descriptorReads = 0;
+  let valueReads = 0;
   const target = ["first", "second"];
   const value = new Proxy(target, {
     ownKeys(current) {
       ownKeyReads += 1;
-      if (ownKeyReads > 1) throw new Error("array own keys observed twice");
       return Reflect.ownKeys(current);
     },
     getOwnPropertyDescriptor(current, key) {
-      const reads = (descriptorReads.get(key) ?? 0) + 1;
-      descriptorReads.set(key, reads);
-      if (reads > 1) throw new Error(`array descriptor observed twice: ${String(key)}`);
+      descriptorReads += 1;
       return Reflect.getOwnPropertyDescriptor(current, key);
     },
     get(current, key, receiver) {
-      if (key === "length") lengthValueReads += 1;
+      valueReads += 1;
       return Reflect.get(current, key, receiver);
     },
   });
@@ -882,22 +956,9 @@ test("report snapshots array proxy keys descriptors and length exactly once", ()
     "first",
     "second",
   ]);
-  assert.deepEqual(
-    {
-      ownKeyReads,
-      zeroDescriptorReads: descriptorReads.get("0"),
-      oneDescriptorReads: descriptorReads.get("1"),
-      lengthDescriptorReads: descriptorReads.get("length"),
-      lengthValueReads,
-    },
-    {
-      ownKeyReads: 1,
-      zeroDescriptorReads: 1,
-      oneDescriptorReads: 1,
-      lengthDescriptorReads: 1,
-      lengthValueReads: 0,
-    },
-  );
+  assert.equal(ownKeyReads, 1);
+  assert.equal(descriptorReads, 4);
+  assert.equal(valueReads, 0);
 });
 
 test("report rejects proxy descriptor trap errors generically", () => {
@@ -1022,6 +1083,87 @@ test("report preserves a schema-valid wide JSON body below the byte cap", () => 
     createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
     value,
   );
+});
+
+test("report rejects an oversized JSON array before traversing children", () => {
+  const input = makeInput();
+  const sentinel = { safe: "unvisited" };
+  const value = Array.from({ length: 65 }, (_, index) =>
+    index === 64 ? sentinel : { safe: index },
+  );
+  setRequestBody(input, value);
+
+  const observations = countDescriptorObservations(sentinel, () => {
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+
+  assert.equal(observations, 0);
+});
+
+test("report rejects an oversized JSON record before traversing children", () => {
+  const input = makeInput();
+  const sentinel = { safe: "unvisited" };
+  const value = Object.fromEntries(
+    Array.from({ length: 65 }, (_, index) => [
+      `field-${index}`,
+      index === 64 ? sentinel : index,
+    ]),
+  );
+  setRequestBody(input, value);
+
+  const observations = countDescriptorObservations(sentinel, () => {
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+
+  assert.equal(observations, 0);
+});
+
+test("report rejects an oversized result wrapper before traversing children", () => {
+  const input = makeInput();
+  const sentinel = result("negative-price", "CONFIRMED");
+  input.vulnerableResults = Array.from({ length: 51 }, (_, index) =>
+    index === 50 ? sentinel : result("negative-price", "CONFIRMED"),
+  );
+
+  const observations = countDescriptorObservations(sentinel, () => {
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+
+  assert.equal(observations, 0);
+});
+
+test("report enforces the total byte budget before traversing later JSON", () => {
+  const input = makeInput();
+  const sentinel = { safe: "unvisited" };
+  setRequestBody(input, [
+    Array.from({ length: 64 }, () => "x".repeat(16_384)),
+    sentinel,
+  ]);
+
+  const observations = countDescriptorObservations(sentinel, () => {
+    assert.equal(rejectionMessage(input), "run report rejected");
+  });
+
+  assert.equal(observations, 0);
+});
+
+test("report rejects an oversized UTF-8 string before serialization", () => {
+  const input = makeInput();
+  const value = "가".repeat(16_385);
+  setRequestBody(input, value);
+  const original = JSON.stringify;
+  let oversizedStringifications = 0;
+  JSON.stringify = ((candidate: unknown, ...rest: unknown[]) => {
+    if (candidate === value) oversizedStringifications += 1;
+    return Reflect.apply(original, JSON, [candidate, ...rest]);
+  }) as typeof JSON.stringify;
+  try {
+    assert.equal(rejectionMessage(input), "run report rejected");
+  } finally {
+    JSON.stringify = original;
+  }
+
+  assert.equal(oversizedStringifications, 0);
 });
 
 test("report validates schema bounds result states cardinality and durations", () => {

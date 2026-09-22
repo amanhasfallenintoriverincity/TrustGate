@@ -26,9 +26,12 @@ const SANDBOX_IMAGE = "localhost/trustgate-target:sandbox";
 /**
  * Mirrors the runner's `PODMAN_TIMEOUT_MS` (`src/sandbox-runner.ts:36`) — it is
  * not exported, so the literal is repeated here. The preflight probes the same
- * trust-boundary binary the runner executes, so a wedged binary must surface as
- * `podman executable unavailable: …` within the same budget instead of hanging
- * the test forever.
+ * trust-boundary binary the runner executes. Node's `spawnSync` `timeout` sends
+ * `killSignal` (SIGTERM by default) once the budget expires but then keeps
+ * waiting for the child to exit, so a child that ignores SIGTERM overshoots the
+ * budget instead of being bounded by it — `killSignal` is therefore pinned to
+ * SIGKILL below. A child that cannot die at all (uninterruptible D-state I/O)
+ * remains the only path that can stall this call indefinitely.
  */
 const PREFLIGHT_TIMEOUT_MS = 30_000;
 
@@ -55,7 +58,7 @@ test(
     const probe = spawnSync(
       PODMAN_EXECUTABLE,
       ["image", "inspect", SANDBOX_IMAGE, "--format", "{{.Id}}"],
-      { encoding: "utf8", timeout: PREFLIGHT_TIMEOUT_MS },
+      { encoding: "utf8", timeout: PREFLIGHT_TIMEOUT_MS, killSignal: "SIGKILL" },
     );
     assert.equal(
       probe.error,
@@ -65,7 +68,11 @@ test(
     assert.equal(
       probe.status,
       0,
-      `sandbox image ${SANDBOX_IMAGE} is missing — run: node scripts/build-demo-image.mjs`,
+      // A signalled death is reported as such: it means the probe never got to
+      // inspect the image, so claiming the image is missing would be a misdiagnosis.
+      probe.signal === null
+        ? `sandbox image ${SANDBOX_IMAGE} is missing — run: node scripts/build-demo-image.mjs`
+        : `podman image inspect ${SANDBOX_IMAGE} was killed by ${probe.signal} — the sandbox image could not be verified`,
     );
 
     const runtimeDir = join(homedir(), ".cache", "trustgate-e2e");

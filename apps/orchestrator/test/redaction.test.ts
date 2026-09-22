@@ -371,3 +371,38 @@ test("the record sink redacts nested fields and passes benign records through by
   assert.equal(redactRecord(benign), benign, "a benign record was copied");
   assert.equal(redactRecord("plain text"), "plain text");
 });
+
+test("redacts a doubled scheme prefix instead of taking it for the value", () => {
+  const raw = fakeSecret("S3cr3tV4lue", "-", "DoNotLeak", "-9f2b");
+  const b64 = fakeSecret("dXNlcjpwYXNz", "d29yZA==");
+  const ghp = fakeToken("ghp_", 36);
+
+  const cases: readonly (readonly [string, string, string])[] = [
+    [`Authorization: Bearer Bearer ${raw}`, raw, "Authorization: Bearer Bearer [REDACTED]"],
+    [`authorization: bearer bearer ${raw}`, raw, "authorization: bearer bearer [REDACTED]"],
+    [`AUTHORIZATION: BEARER BEARER ${raw}`, raw, "AUTHORIZATION: BEARER BEARER [REDACTED]"],
+    [`authorization=bearer bearer ${raw}`, raw, "authorization=bearer bearer [REDACTED]"],
+    [`Authorization: Basic Basic ${b64}`, b64, "Authorization: Basic Basic [REDACTED]"],
+    [`Authorization: Bearer Bearer ${ghp}`, ghp, "Authorization: Bearer Bearer [REDACTED]"],
+    [`Authorization: Bearer Bearer Bearer ${raw}`, raw, "Authorization: Bearer Bearer Bearer [REDACTED]"],
+    [`{"route":"Authorization: Bearer Bearer ${raw}"}`, raw, '{"route":"Authorization: Bearer Bearer [REDACTED]"}'],
+  ];
+
+  cases.forEach(([line, secret, expected], index) => {
+    const output = redact(line);
+    assertNoSecret(output, [secret], `doubled scheme ${index}`);
+    assert.equal(output, expected, `doubled scheme ${index} did not keep its shape`);
+    // Re-redacting an already redacted line must neither resurrect nor rewrite anything.
+    assert.equal(redact(output), output, `doubled scheme ${index} is not idempotent`);
+  });
+});
+
+test("keeps the single scheme prefix on the existing fast path", () => {
+  const token = fakeToken("ghp_", 36);
+  const single = `Authorization: Bearer ${token}`;
+
+  assert.equal(redact(single), "Authorization: Bearer [REDACTED]");
+  assert.equal(redact(`Authorization: Basic ${token}`), "Authorization: Basic [REDACTED]");
+  assert.equal(redact(`Bearer ${token}`), "Bearer [REDACTED]");
+  assert.equal(redact(redact(single)), redact(single));
+});

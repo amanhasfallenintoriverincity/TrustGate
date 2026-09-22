@@ -15,6 +15,15 @@
  * Boundary: the rules match literal text. A credential that is itself encoded (base64, percent,
  * hex) is not decoded here; a credential written verbatim inside an encoded surrounding (for
  * example `Authorization%3A%20Bearer%20ghp_…`) is still removed by value matching.
+ *
+ * Accepted boundaries (deliberate trades, not defects):
+ * - Encoding is not decoded. The boundary above stays as it is: an encoded credential keeps its
+ *   encoded form, and only a credential written verbatim inside an encoded surrounding is removed
+ *   by value matching. Decoding at this layer would add attack surface for no gain.
+ * - Prose that merely reads like a scheme is over-redacted. `the bearer of good news` becomes
+ *   `the bearer [REDACTED] good news`, and `basic terms and conditions` behaves the same way.
+ *   Machine-generated JSON logs lose nothing in those sentences, and a false positive is the safe
+ *   direction to err in, so the over-match is accepted rather than narrowed.
  */
 
 /** Written in place of every credential-shaped match. */
@@ -54,7 +63,7 @@ const credentialReplacer =
 
 /** `Bearer <credential>` / `Basic <credential>`, with or without an `Authorization` prefix. */
 const SCHEME_PATTERN = new RegExp(
-  `\\b(bearer|basic)(${GAP}+)(?!(?:authentication|authorization|scheme|header)\\b)${VALUE}`,
+  `\\b(bearer|basic)(${GAP}+)(?!(?:authentication|authorization|scheme|header)\\b)(?!(?:bearer|basic)${GAP})${VALUE}`,
   "gi",
 );
 

@@ -12,6 +12,7 @@
  * captures raw request headers (including `authorization`).
  */
 import { randomUUID } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import type { Socket } from "node:net";
@@ -369,26 +370,69 @@ const parseRunBody = (body: unknown, mode: ServerMode): ParsedRunBody => {
 const isInside = (root: string, candidate: string): boolean =>
   candidate === root || candidate.startsWith(root.endsWith(sep) ? root : root + sep);
 
+/**
+ * Identity of the allowlist root, captured once when the server is built. Path checks compare
+ * against this instead of a freshly resolved `rootDir`: replacing the root itself (a symlink in
+ * its place, or a new directory at the same path) would otherwise silently redefine the
+ * allowlist.
+ */
+export type RootIdentity = {
+  /** Canonical path of the pinned root; stays the baseline for every containment check. */
+  readonly realPath: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+};
+
+/** Pins the allowlist root; `undefined` when it is not an existing directory. */
+const pinRootIdentity = (rootDir: string): RootIdentity | undefined => {
+  try {
+    const realPath = realpathSync(rootDir);
+    const stats = statSync(realPath, { bigint: true });
+    if (!stats.isDirectory()) return undefined;
+    return { realPath, dev: stats.dev, ino: stats.ino };
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * True while `rootDir` still names the directory that was pinned. A swapped-in symlink resolves
+ * somewhere else, and a recreated directory at the same path has a different device/inode pair.
+ */
+const rootStillPinned = async (
+  rootDir: string,
+  identity: RootIdentity,
+): Promise<boolean> => {
+  try {
+    if ((await realpath(rootDir)) !== identity.realPath) return false;
+    const stats = await stat(identity.realPath, { bigint: true });
+    return stats.isDirectory() && stats.dev === identity.dev && stats.ino === identity.ino;
+  } catch {
+    return false;
+  }
+};
+
 type ResolvedRepoPath = { ok: true; path: string } | { ok: false };
 
 const hasTraversalSegment = (candidate: string): boolean =>
   candidate.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..");
 
 /**
- * Real-path containment check: `target` must exist, resolve (symlinks included) inside the
- * allowlist root, and stay a directory. Shared by request-time normalization and the
- * pre-pipeline re-validation so both enforce exactly the same rules.
+ * Real-path containment check against the pinned root: the root must still match its identity,
+ * `target` must exist, resolve (symlinks included) inside that root, and stay a directory.
+ * An unpinned root admits nothing, so a root that cannot be resolved fails closed.
  */
 const resolveRealPathInsideRoot = async (
   rootDir: string,
+  identity: RootIdentity | undefined,
   target: string,
 ): Promise<string | undefined> => {
+  if (identity === undefined) return undefined;
   try {
-    const root = await realpath(rootDir);
-    if (!(await stat(root)).isDirectory()) return undefined;
-    if (!isInside(root, target)) return undefined;
+    if (!(await rootStillPinned(rootDir, identity))) return undefined;
+    if (!isInside(identity.realPath, target)) return undefined;
     const resolved = await realpath(target);
-    if (!isInside(root, resolved)) return undefined;
+    if (!isInside(identity.realPath, resolved)) return undefined;
     if (!(await stat(resolved)).isDirectory()) return undefined;
     return resolved;
   } catch {
@@ -416,16 +460,22 @@ export const isRepoPathAllowedInRoot = async (
   rootDir: string,
   repoPath: string,
 ): Promise<boolean> =>
-  (await resolveRealPathInsideRoot(rootDir, repoPath)) !== undefined;
+  (await resolveRealPathInsideRoot(rootDir, pinRootIdentity(rootDir), repoPath)) !== undefined;
 
-/** Wraps a pipeline factory with the pre-execution re-validation above. */
+/**
+ * Wraps a pipeline factory with the pre-execution re-validation above. Pass the identity pinned
+ * when the server was built so both checks share one baseline; without it the root is pinned
+ * freshly on every call.
+ */
 export const createReverifiedPipelineFactory = (
   rootDir: string,
   createWorkspacePipeline: WorkspacePipelineFactory,
+  identity?: RootIdentity,
 ): WorkspacePipelineFactory =>
   async function reverifiedPipelineFactory(task) {
     if (task.source === "workspace" && task.repoPath !== undefined) {
-      if (!(await isRepoPathAllowedInRoot(rootDir, task.repoPath))) {
+      const pinned = identity ?? pinRootIdentity(rootDir);
+      if ((await resolveRealPathInsideRoot(rootDir, pinned, task.repoPath)) === undefined) {
         throw new InvalidRepoPathError();
       }
     }
@@ -439,20 +489,18 @@ export const createReverifiedPipelineFactory = (
  */
 const resolveWorkspaceRepoPath = async (
   rootDir: string,
+  identity: RootIdentity | undefined,
   candidate: string | undefined,
 ): Promise<ResolvedRepoPath> => {
   if (candidate !== undefined) {
     if (isAbsolute(candidate) || candidate.includes("\\")) return { ok: false };
     if (hasTraversalSegment(candidate)) return { ok: false };
   }
-  try {
-    const root = await realpath(rootDir);
-    const target = candidate === undefined ? root : join(root, candidate);
-    const resolved = await resolveRealPathInsideRoot(rootDir, target);
-    return resolved === undefined ? { ok: false } : { ok: true, path: resolved };
-  } catch {
-    return { ok: false };
-  }
+  if (identity === undefined) return { ok: false };
+  const target =
+    candidate === undefined ? identity.realPath : join(identity.realPath, candidate);
+  const resolved = await resolveRealPathInsideRoot(rootDir, identity, target);
+  return resolved === undefined ? { ok: false } : { ok: true, path: resolved };
 };
 
 const routeLabel = (request: FastifyRequest): string => {
@@ -483,14 +531,20 @@ const CLIENT_ERROR_BODY = JSON.stringify(INVALID_REQUEST);
 export const buildServer = (options: BuildServerOptions = {}): FastifyInstance => {
   const mode = options.mode ?? "workspace";
   const rootDir = options.rootDir ?? DEFAULT_ROOT_DIR;
+  // The allowlist root is pinned exactly once, here. A root that is later replaced by a symlink
+  // (or by a fresh directory at the same path) no longer matches its identity, and every path
+  // check below refuses it. A root that cannot be pinned admits nothing at all: failing closed
+  // keeps a mistyped or missing root from being redefined by whoever controls its parent.
+  const rootIdentity = pinRootIdentity(rootDir);
   const log = options.log;
   const createWorkspacePipeline =
     options.createWorkspacePipeline ?? createDefaultWorkspacePipeline;
   const executeRun =
     options.executeRun ??
     createDefaultExecutor(
-      // The default executor re-validates the accepted path right before the pipeline runs.
-      createReverifiedPipelineFactory(rootDir, createWorkspacePipeline),
+      // The default executor re-validates the accepted path, against the same pinned root,
+      // right before the pipeline runs.
+      createReverifiedPipelineFactory(rootDir, createWorkspacePipeline, rootIdentity),
     );
 
   const runs = new Map<string, RunResponse>();
@@ -588,6 +642,7 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
       if (parsed.task.source === "workspace") {
         const resolved = await resolveWorkspaceRepoPath(
           rootDir,
+          rootIdentity,
           parsed.task.repoPath,
         );
         if (!resolved.ok) {

@@ -12,8 +12,8 @@
  * trace, a host path, or a framework message. Shutdown stops accepting work, gives in-flight
  * runs `SHUTDOWN_GRACE_MS` to finish, then forces the exit with a matching log record.
  */
-import { writeSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { realpathSync, writeSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { buildServer, type RunLogRecord, type ServerMode } from "./server.js";
 
@@ -50,25 +50,53 @@ export const readMode = (value: string | undefined): ServerMode => {
   throw new ConfigError("invalid_mode");
 };
 
+/**
+ * Ports are read as a plain decimal string. `Number()` alone would also accept notations that no
+ * operator writes on purpose (`0x10`, `1e3`, `00123`), so the shape is checked before the range.
+ * The pattern also rejects a leading zero, which keeps `"00123"` from silently meaning `123`.
+ */
+const PORT_PATTERN = /^[1-9]\d{0,4}$/;
+
 export const readPort = (value: string | undefined): number => {
   if (value === undefined) return DEFAULT_PORT;
+  if (!PORT_PATTERN.test(value)) throw new ConfigError("invalid_port");
   const port = Number(value);
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new ConfigError("invalid_port");
-  }
+  if (port > 65_535) throw new ConfigError("invalid_port");
   return port;
+};
+
+let stdoutErrorGuarded = false;
+
+/**
+ * A reader that goes away (a closed pipe, a terminal that exits) leaves `process.stdout`
+ * permanently broken; without a listener its `error` event is unhandled and takes the process
+ * down. Install one listener, once, before the first write: a lost diagnostic record is
+ * acceptable, a crash is not.
+ */
+const guardStdoutErrors = (): void => {
+  if (stdoutErrorGuarded) return;
+  stdoutErrorGuarded = true;
+  process.stdout.on("error", () => {});
 };
 
 /**
  * Writes one JSON line. `writeSync` keeps the record intact when the process exits immediately
- * afterwards: buffered pipe output would otherwise be dropped on a forced shutdown.
+ * afterwards: buffered pipe output would otherwise be dropped on a forced shutdown. Both writes
+ * are best-effort — if the stream is gone, the record is lost and the process carries on.
  */
 export const writeLog = (record: ServerLogRecord | RunLogRecord): void => {
   const line = `${JSON.stringify(record)}\n`;
+  guardStdoutErrors();
   try {
     writeSync(process.stdout.fd, line);
+    return;
   } catch {
+    // `writeSync` cannot report a closed pipe to the stream; fall through to the stream API.
+  }
+  try {
     process.stdout.write(line);
+  } catch {
+    // The stream is destroyed beyond recovery: drop the record.
   }
 };
 
@@ -123,12 +151,17 @@ export const installShutdownHandlers = (options: ShutdownOptions): void => {
   process.on("SIGTERM", handle);
 };
 
-/** True when this module is the process entry point (importing it must not start a server). */
+/**
+ * True when this module is the process entry point (importing it must not start a server). Both
+ * sides are resolved to their real path: a symlinked, relative, or `..`-containing entry path
+ * names the same file as the module URL, and comparing the raw strings would silently skip
+ * `run()` and exit 0 as if everything were fine.
+ */
 const isDirectRun = (moduleUrl: string): boolean => {
   const entry = process.argv[1];
   if (entry === undefined) return false;
   try {
-    return moduleUrl === pathToFileURL(entry).href;
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(entry);
   } catch {
     return false;
   }

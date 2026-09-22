@@ -1058,3 +1058,72 @@ test("a path swapped after acceptance is rejected before the pipeline is built",
     await rm(outside, { recursive: true, force: true });
   }
 });
+
+test("the allowlist root is pinned when the server is built", async () => {
+  const scratch = process.env.TMPDIR ?? tmpdir();
+  const parent = await mkdtemp(join(scratch, "trustgate-server-rootid-"));
+  const outside = await mkdtemp(join(scratch, "trustgate-server-rootid-outside-"));
+  const root = join(parent, "root");
+  const pipelineRoots: string[] = [];
+  const records: RunLogRecord[] = [];
+  await mkdir(join(root, "target"), { recursive: true });
+  await mkdir(join(outside, "target"), { recursive: true });
+
+  const app = buildServer({
+    mode: "workspace",
+    rootDir: root,
+    createWorkspacePipeline: (task) => {
+      pipelineRoots.push(task.repoPath ?? "");
+      return createPipeline();
+    },
+    log: (record) => records.push(record),
+  });
+
+  try {
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "target" },
+    });
+    assert.equal(accepted.statusCode, 201);
+    assert.deepEqual(pipelineRoots, [join(root, "target")]);
+
+    // The allowlist root itself is replaced by a symlink to a directory outside of it: the
+    // pinned identity, not the path, decides whether a path is still inside the root.
+    pipelineRoots.length = 0;
+    rmSync(root, { recursive: true, force: true });
+    symlinkSync(outside, root);
+    const swapped = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "target" },
+    });
+    assert.equal(swapped.statusCode, 400);
+    assert.deepEqual(swapped.json(), { error: "invalid repository path" });
+    assert.deepEqual(pipelineRoots, [], "the pipeline ran under a replaced root");
+    assert.ok(!swapped.body.includes(root), "swapped response echoed the root");
+    assert.ok(!swapped.body.includes(outside), "swapped response echoed the swap target");
+
+    // A new directory at the same path is a different directory, not the pinned root.
+    rmSync(root, { recursive: true, force: true });
+    await mkdir(join(root, "target"), { recursive: true });
+    const recreated = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "target" },
+    });
+    assert.equal(recreated.statusCode, 400);
+    assert.deepEqual(recreated.json(), { error: "invalid repository path" });
+    assert.deepEqual(pipelineRoots, []);
+    assert.deepEqual(
+      records
+        .filter((record) => record.event === "run.rejected")
+        .map((record) => (record.event === "run.rejected" ? record.reason : "")),
+      ["invalid_repo_path", "invalid_repo_path"],
+    );
+  } finally {
+    await app.close();
+    await rm(parent, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});

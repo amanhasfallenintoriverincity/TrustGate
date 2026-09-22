@@ -51,7 +51,7 @@
     "prebuild": "npm run build:deps",
     "build": "tsc -p tsconfig.build.json",
     "pretest": "npm run build:deps",
-    "test": "tsx --test test/*.test.ts",
+    "test": "tsx --test test/*.test.ts test/e2e/*.test.ts",
     "pretypecheck": "npm run build:deps",
     "typecheck": "tsc --noEmit"
   },

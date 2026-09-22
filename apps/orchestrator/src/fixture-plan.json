@@ -15,8 +15,8 @@
       "evidence": [
         {
           "file": "apps/demo-target/src/store.ts",
-          "line": 7,
-          "excerpt": "const price = request.body.price;"
+          "line": 29,
+          "excerpt": "const charged = mode === \"vulnerable\" ? input.price : serverPrice;"
         }
       ],
       "tests": [
@@ -33,42 +33,42 @@
           ]
         },
         {
-          "id": "oversized-quantity",
+          "id": "underpriced-price",
           "request": {
             "method": "POST",
             "path": "/api/purchase",
-            "body": { "itemId": "shield", "quantity": 99 }
+            "body": { "itemId": "sword", "price": 1 }
           },
           "assertions": [
             { "kind": "status", "equals": 400 },
-            { "kind": "state-delta", "key": "inventoryCount", "equals": 3 }
+            { "kind": "state-delta", "key": "balance", "equals": 0 }
           ]
         }
       ]
     },
     {
       "id": "ownership-check",
-      "title": "Purchase must reject items owned by another actor",
+      "title": "Transfer must verify the actor owns the item",
       "category": "ownership-bypass",
       "severity": "critical",
       "evidence": [
         {
-          "file": "apps/demo-target/src/server.ts",
-          "line": 42,
-          "excerpt": "const actorId = request.headers[\"x-actor-id\"];"
+          "file": "apps/demo-target/src/store.ts",
+          "line": 35,
+          "excerpt": "if (mode === \"patched\" && owners.get(input.itemId) !== actorId) {"
         }
       ],
       "tests": [
         {
-          "id": "foreign-item",
+          "id": "foreign-transfer",
           "request": {
             "method": "POST",
-            "path": "/api/purchase",
-            "body": { "itemId": "relic", "quantity": 1 }
+            "path": "/api/transfer",
+            "body": { "itemId": "relic", "toUserId": "alice" }
           },
           "assertions": [
             { "kind": "status", "equals": 403 },
-            { "kind": "state-delta", "key": "balance", "equals": 0 }
+            { "kind": "state-delta", "key": "inventoryCount", "equals": 0 }
           ]
         }
       ]
@@ -80,21 +80,30 @@
       "hypothesisId": "price-authority",
       "verdict": "CONFIRMED",
       "executed": true,
-      "evidence": [{ "kind": "status", "expected": 400, "actual": 200 }]
+      "evidence": [
+        { "kind": "status", "expected": 400, "actual": 200 },
+        { "kind": "state-delta", "expected": 0, "actual": 100 }
+      ]
     },
     {
-      "runId": "spec-oversized-quantity",
+      "runId": "spec-underpriced-price",
       "hypothesisId": "price-authority",
       "verdict": "CONFIRMED",
       "executed": true,
-      "evidence": [{ "kind": "status", "expected": 400, "actual": 201 }]
+      "evidence": [
+        { "kind": "status", "expected": 400, "actual": 200 },
+        { "kind": "state-delta", "expected": 0, "actual": -1 }
+      ]
     },
     {
-      "runId": "spec-foreign-item",
+      "runId": "spec-foreign-transfer",
       "hypothesisId": "ownership-check",
       "verdict": "CONFIRMED",
       "executed": true,
-      "evidence": [{ "kind": "status", "expected": 403, "actual": 200 }]
+      "evidence": [
+        { "kind": "status", "expected": 403, "actual": 200 },
+        { "kind": "state-delta", "expected": 0, "actual": 1 }
+      ]
     }
   ],
   "patchedResults": [
@@ -106,14 +115,14 @@
       "evidence": []
     },
     {
-      "runId": "spec-oversized-quantity",
+      "runId": "spec-underpriced-price",
       "hypothesisId": "price-authority",
       "verdict": "BLOCKED",
       "executed": true,
       "evidence": []
     },
     {
-      "runId": "spec-foreign-item",
+      "runId": "spec-foreign-transfer",
       "hypothesisId": "ownership-check",
       "verdict": "BLOCKED",
       "executed": true,
@@ -121,10 +130,10 @@
     }
   ],
   "durations": {
-    "totalMs": 1840,
+    "totalMs": 3140,
     "ocrMs": 210,
     "planningMs": 640,
-    "vulnerableMs": 470,
-    "patchedMs": 520
+    "vulnerableMs": 1139,
+    "patchedMs": 1151
   }
 }

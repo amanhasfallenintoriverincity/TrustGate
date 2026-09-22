@@ -26,3 +26,23 @@ test("patched transfer rejects an item not owned by the actor", () => {
   assert.equal(response.status, 403);
   assert.equal(store.ownerOf("alice-shield"), "alice");
 });
+
+test("vulnerable transfer of the seeded foreign item moves it and grows alice's inventory", () => {
+  const store = createStore("vulnerable");
+  const before = store.snapshot("alice");
+  const response = store.transfer("alice", { itemId: "relic", toUserId: "alice" });
+  const after = store.snapshot("alice");
+  assert.equal(response.status, 200);
+  assert.equal(after.inventoryCount - before.inventoryCount, 1);
+  assert.equal(store.ownerOf("relic"), "alice");
+});
+
+test("patched transfer rejects the foreign item seeded to bob", () => {
+  const store = createStore("patched");
+  const before = store.snapshot("alice");
+  const response = store.transfer("alice", { itemId: "relic", toUserId: "alice" });
+  const after = store.snapshot("alice");
+  assert.equal(response.status, 403);
+  assert.equal(after.inventoryCount, before.inventoryCount);
+  assert.equal(store.ownerOf("relic"), "bob");
+});

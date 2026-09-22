@@ -27,6 +27,8 @@ ipcns="private"
 pidns="private"
 utsns="private"
 cgroupns="private"
+[engine]
+cgroup_manager="cgroupfs"
 `;
 
 const MAX_PATH_LENGTH = 4096;

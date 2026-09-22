@@ -8,7 +8,7 @@ export const createStore = (mode: Mode) => {
     ["alice", 100],
     ["bob", 100],
   ]);
-  const owners = new Map([["alice-shield", "alice"]]);
+  const owners = new Map([["alice-shield", "alice"], ["relic", "bob"]]);
 
   return {
     snapshot(userId: string) {

@@ -631,6 +631,20 @@ test("trusted containers.conf pins secure Podman defaults", () => {
   }
 });
 
+test("trusted containers.conf pins the cgroup manager for session-less runtimes", () => {
+  assert.match(SANDBOX_CONTAINERS_CONF, /^\[engine\]$/m);
+  assert.match(
+    SANDBOX_CONTAINERS_CONF,
+    /^cgroup_manager="cgroupfs"$/m,
+    "a redirected XDG_RUNTIME_DIR has no systemd user session to warn about",
+  );
+  assert.ok(
+    SANDBOX_CONTAINERS_CONF.indexOf("[containers]") <
+      SANDBOX_CONTAINERS_CONF.indexOf("[engine]"),
+    "the container defaults must keep the leading section",
+  );
+});
+
 test(
   "Podman accepts the trusted config with the minimal process environment",
   {

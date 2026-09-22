@@ -1402,3 +1402,220 @@ test("report rejects serialized output above one MiB", () => {
 
   assert.equal(rejectionMessage(input), "run report rejected");
 });
+
+// --- Fifth review pins: route escapes, non-identifier path prefixes, key aliases, byte accounting ---
+
+const routeEscapedTraversalPaths = [
+  "/api/../../etc/passwd",
+  "/api/../../etc/hosts",
+  "/api/../../../../root/.bashrc",
+  "/api/../etc/hosts",
+  "/api//../../etc/passwd",
+  "/api/./../../etc/passwd",
+  "./../../etc/passwd",
+] as const;
+
+test("report rejects route-escaped traversal paths as values keys and excerpts", () => {
+  for (const path of routeEscapedTraversalPaths) {
+    const asValue = makeInput();
+    setRequestBody(asValue, { note: path });
+    assert.equal(rejectionMessage(asValue), "run report rejected", `value ${path}`);
+
+    const asKey = makeInput();
+    setRequestBody(asKey, { [path]: "public-example" });
+    assert.equal(rejectionMessage(asKey), "run report rejected", `key ${path}`);
+
+    const asExcerpt = makeInput();
+    asExcerpt.hypotheses[0]!.evidence[0]!.excerpt = path;
+    assert.equal(
+      rejectionMessage(asExcerpt),
+      "run report rejected",
+      `excerpt ${path}`,
+    );
+  }
+});
+
+const nonIdentifierPathPrefixes = [
+  "*/etc/passwd",
+  "**/etc/passwd**",
+  "#/etc/passwd",
+  "!/etc/shadow",
+  "~/etc/shadow",
+  "%/etc/shadow",
+  "|/etc/shadow",
+  "+/etc/shadow",
+  "`/etc/shadow`",
+  String.raw`\/etc/passwd`,
+  String.raw`\\/server/share`,
+  String.raw`\\\\/server\share`,
+  String.raw`\//server/share`,
+] as const;
+
+test("report rejects non-identifier path prefixes and mixed separators", () => {
+  for (const path of nonIdentifierPathPrefixes) {
+    const asValue = makeInput();
+    setRequestBody(asValue, { note: path });
+    assert.equal(rejectionMessage(asValue), "run report rejected", `value ${path}`);
+
+    const asKey = makeInput();
+    setRequestBody(asKey, { [path]: "public-example" });
+    assert.equal(rejectionMessage(asKey), "run report rejected", `key ${path}`);
+  }
+});
+
+const approvedPathControls = [
+  "apps/demo-target/src/store.ts",
+  "apps/orchestrator/src/report.ts",
+  "src/private-key.ts",
+  "docs/secret-notes.md",
+  "./src/store.ts",
+  ".gitignore",
+  "arr[0..5]",
+  "node_/srv/app",
+  "A/srv/project/private",
+  "/api/health",
+  "/api/v1/users",
+  "/api/token/refresh",
+  "GET /api/health returns 200",
+  "// TODO: revisit pricing",
+] as const;
+
+test("report keeps relative routes identifier prefixes and comment markers approved", () => {
+  for (const value of approvedPathControls) {
+    const input = makeInput();
+    setRequestBody(input, { note: value });
+    assert.deepEqual(
+      createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
+      { note: value },
+      value,
+    );
+  }
+});
+
+const credentialKeyAliases = ["dbPass", "pwd", "creds", "bearer"] as const;
+
+const sensitivePlanKeysToStayRejected = [
+  "passwordBackup",
+  "store_password_backup",
+  "my_secret_key",
+  "promptValue",
+  "tokenValue",
+] as const;
+
+const approvedKeyNearWords = [
+  "standardError",
+  "tokenCount",
+  "tokenizerName",
+  "authoredAt",
+  "durations",
+  "evidence",
+  "excerpt",
+  "expected",
+  "actual",
+] as const;
+
+test("report rejects credential key aliases and keeps near-word keys approved", () => {
+  for (const key of credentialKeyAliases) {
+    const input = makeInput();
+    setRequestBody(input, { [key]: "public-example" });
+    assert.equal(rejectionMessage(input), "run report rejected", `alias ${key}`);
+  }
+
+  for (const key of sensitivePlanKeysToStayRejected) {
+    const input = makeInput();
+    setRequestBody(input, { [key]: "public-example" });
+    assert.equal(rejectionMessage(input), "run report rejected", `sensitive ${key}`);
+  }
+
+  for (const key of approvedKeyNearWords) {
+    const input = makeInput();
+    setRequestBody(input, { [key]: "public-example" });
+    assert.deepEqual(
+      createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
+      { [key]: "public-example" },
+      key,
+    );
+  }
+
+  for (const prose of [
+    "the password field is validated",
+    "credentials are rotated hourly",
+  ]) {
+    const input = makeInput();
+    setRequestBody(input, { note: prose });
+    assert.deepEqual(
+      createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
+      { note: prose },
+      prose,
+    );
+  }
+
+  for (const fileName of ["private-key.ts", "secret-store.ts"]) {
+    const asValue = makeInput();
+    setRequestBody(asValue, { note: fileName });
+    assert.deepEqual(
+      createRunReport(asValue).hypotheses[0]?.tests[0]?.request.body,
+      { note: fileName },
+      `value ${fileName}`,
+    );
+
+    const asReviewedFile = makeInput();
+    asReviewedFile.reviewedFiles = ["apps/demo-target/src/store.ts", fileName];
+    assert.ok(
+      createRunReport(asReviewedFile).reviewedFiles.includes(fileName),
+      `reviewedFile ${fileName}`,
+    );
+  }
+});
+
+const escapeDenseStrings = (escape: string, count = 62): string[] =>
+  Array.from({ length: count }, () => escape.repeat(16_384));
+
+test("report rejects escape-dense JSON before traversing later payloads", () => {
+  for (const escape of ['"', "\\", "\u0001"]) {
+    const input = makeInput();
+    const sentinel = { safe: "unvisited" };
+    setRequestBody(input, [...escapeDenseStrings(escape), sentinel]);
+
+    const observations = countDescriptorObservations(sentinel, () => {
+      assert.equal(
+        rejectionMessage(input),
+        "run report rejected",
+        `escape ${escape.charCodeAt(0)}`,
+      );
+    });
+
+    assert.equal(observations, 0, `escape ${escape.charCodeAt(0)}`);
+  }
+});
+
+test("report rejects escape-dense payloads without stringifying them", () => {
+  const input = makeInput();
+  const value = '"'.repeat(16_384);
+  setRequestBody(input, [...escapeDenseStrings('"'), { safe: "unvisited" }]);
+
+  const original = JSON.stringify;
+  let stringifications = 0;
+  JSON.stringify = ((candidate: unknown, ...rest: unknown[]) => {
+    if (candidate === value) stringifications += 1;
+    return Reflect.apply(original, JSON, [candidate, ...rest]);
+  }) as typeof JSON.stringify;
+  try {
+    assert.equal(rejectionMessage(input), "run report rejected");
+  } finally {
+    JSON.stringify = original;
+  }
+
+  assert.equal(stringifications, 0);
+});
+
+test("report accepts escape-dense JSON below the byte cap", () => {
+  const input = makeInput();
+  const values = escapeDenseStrings('"', 16);
+  setRequestBody(input, values);
+
+  assert.deepEqual(
+    createRunReport(input).hypotheses[0]?.tests[0]?.request.body,
+    values,
+  );
+});

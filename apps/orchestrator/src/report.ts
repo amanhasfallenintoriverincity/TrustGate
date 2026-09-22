@@ -86,8 +86,8 @@ const SENSITIVE_REVIEWED_FILE_BASENAME_PATTERN =
 const SENSITIVE_PATH_TOKEN_PATTERN =
   /(?:^|[/\\])(?:id_(?:rsa|dsa|ecdsa|ed25519)|private[-_.]?key)(?:$|[/\\\s"'`()\[\]{},;<>])/i;
 const DRIVE_LETTER_PATH_PATTERN =
-  /(?:^|[^A-Za-z0-9_.-])[A-Za-z]:[\\/][^\s"'`<>]*/;
-const UNC_PATH_PATTERN = /(?:^|[\s"'`([{=:>,;])\\\\[^\\\s]+\\[^\\\s]+/;
+  /(?:^|[^A-Za-z0-9_-])[A-Za-z]:[\\/][^\s"'`<>]*/;
+const UNC_PATH_PATTERN = /(?:^|[^A-Za-z0-9_-])\\\\[^\\\s]+\\[^\s]+/;
 const SENSITIVE_STRING_PATTERNS = [
   /\braw[-_ ]?(?:(?:system|user|developer)[-_ ]?)?(?:prompt|error)(?:[-_ ]?(?:detail|message|stack))?(?:[-_ ]?marker)?\b/i,
   /\bauthorization\s*[:=]\s*\S+/i,
@@ -176,6 +176,36 @@ const maxContainerEntries = (context: SnapshotContext): number =>
   context.arrayLimit ??
   (context.jsonValue ? JSON_MAX_ARRAY_LENGTH : MAX_REPORT_WRAPPER_ENTRIES);
 
+// JSON escaping costs bytes beyond the raw UTF-8 length: '"' and '\\' gain one byte, and
+// control characters or lone surrogates expand to six-byte \uXXXX forms. The estimate is
+// an upper bound so escape-dense inputs fail fast during traversal, before any
+// serialization of the raw payload runs.
+const JSON_ESCAPE_CHARACTER_PATTERN = /["\\\u0000-\u001f\ud800-\udfff]/;
+
+const jsonStringByteLength = (value: string): number => {
+  const baseBytes = Buffer.byteLength(value, "utf8") + 2;
+  if (!JSON_ESCAPE_CHARACTER_PATTERN.test(value)) return baseBytes;
+  let extraBytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c) {
+      extraBytes += 1;
+    } else if (code < 0x20) {
+      extraBytes += 5;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index += 1;
+      } else {
+        extraBytes += 5;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      extraBytes += 5;
+    }
+  }
+  return baseBytes + extraBytes;
+};
+
 const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
   const ancestors = new Set<object>();
   let visited = 0;
@@ -206,7 +236,7 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
       ) {
         return rejectReport();
       }
-      accountBytes(Buffer.byteLength(value, "utf8") + 2);
+      accountBytes(jsonStringByteLength(value));
       return value;
     }
     if (typeof value === "boolean") {
@@ -323,7 +353,7 @@ const snapshotJsonOrigin = (root: unknown): JsonSnapshot => {
         if (context.jsonValue && key.length > 256) {
           return rejectReport();
         }
-        accountBytes(Buffer.byteLength(key, "utf8") + 3);
+        accountBytes(jsonStringByteLength(key) + 1);
         Object.defineProperty(snapshot, key, {
           configurable: true,
           enumerable: true,
@@ -384,13 +414,58 @@ const containsSensitivePathBasename = (value: string): boolean =>
     );
   });
 
+// Frozen path policy and its intentional limits:
+//   (a) A path-like prefix glued to an identifier character cannot be told apart from an
+//       ordinary relative repo path ("A/srv/project/private", "node_/srv/app"), so those
+//       stay approved — an intentional limitation, not an oversight.
+//   (b) Encoded or obfuscated secrets (URL-encoded, base64) are out of scope here.
+//   (c) Route allowlist: a candidate is a normal route only when its normalized first
+//       segment is "api" and at least one more segment follows ("/api/health").
+//   (d) A candidate whose token starts with "./" or "../" is an explicitly relative path
+//       and stays approved, except that any ".." segment is traversal and always rejects.
+//   (e) A candidate made of slashes alone is the host root ("/") and rejects; a bare "//"
+//       marker (an empty-segment comment such as "// TODO") is not a path and is skipped.
+const PATH_CANDIDATE_PATTERN = /(?:^|[^A-Za-z0-9_-])(\/{1,2})([^\s"'`<>]*)/g;
+const IDENTIFIER_CHAR_PATTERN = /[A-Za-z0-9_-]/;
+const ROUTE_PATH_SEGMENT_ALLOWLIST = new Set(["api"]);
+
+const hasTraversalSegment = (rest: string): boolean =>
+  rest.split("/").some((segment) => segment === "..");
+
+const isExplicitRelativePathPrefix = (
+  value: string,
+  slashIndex: number,
+  slashCount: number,
+): boolean => {
+  if (slashCount !== 1) return false;
+  let dots = 0;
+  while (value[slashIndex - dots - 1] === ".") dots += 1;
+  if (dots !== 1 && dots !== 2) return false;
+  const before = value[slashIndex - dots - 1];
+  return before === undefined || !IDENTIFIER_CHAR_PATTERN.test(before);
+};
+
+const isHostPathCandidate = (value: string, token: RegExpExecArray): boolean => {
+  const slashes = token[1]!;
+  const rest = token[2]!;
+  const slashIndex = token.index + (token[0].length - slashes.length - rest.length);
+  // Traversal is never a normal route, whichever prefix or separators it uses.
+  if (hasTraversalSegment(rest)) return true;
+  if (rest.replaceAll("/", "").length === 0) return slashes.length < 2;
+  if (isExplicitRelativePathPrefix(value, slashIndex, slashes.length)) return false;
+  const segments = rest
+    .split("/")
+    .filter((segment) => segment !== "" && segment !== ".");
+  return !(
+    segments.length >= 2 && ROUTE_PATH_SEGMENT_ALLOWLIST.has(segments[0]!)
+  );
+};
+
 const hasAbsolutePosixHostPath = (value: string): boolean => {
-  const pathTokens = value.match(/(?:^|[\s"'`([{=:>,;])\/{1,2}[^\s"'`<>]*/g);
-  if (pathTokens === null) return false;
-  return pathTokens.some((token) => {
-    const path = token.trimStart();
-    return !path.startsWith("/api/");
-  });
+  for (const token of value.matchAll(PATH_CANDIDATE_PATTERN)) {
+    if (isHostPathCandidate(value, token)) return true;
+  }
+  return false;
 };
 
 // Host filesystem locations: POSIX absolutes, drive-letter paths and UNC shares.
@@ -454,6 +529,11 @@ const SENSITIVE_KEY_WORDS = new Set([
   "oauth",
   "password",
   "passwd",
+  // Credential aliases: keys such as dbPass, pwd, creds and bearer hold credentials too.
+  "pass",
+  "pwd",
+  "cred",
+  "bearer",
   "secret",
   "credential",
   "prompt",
@@ -496,8 +576,11 @@ const SAFE_COMPACT_KEY_FAMILIES = [
   "environmental",
 ] as const;
 
+// Words that end in "s" without being plurals keep their exact form.
+const NON_PLURAL_S_WORDS = new Set(["access", "pass"]);
+
 const pluralStem = (word: string): string =>
-  word.endsWith("s") && word !== "access" ? word.slice(0, -1) : word;
+  word.endsWith("s") && !NON_PLURAL_S_WORDS.has(word) ? word.slice(0, -1) : word;
 
 // Family stems that stay sensitive everywhere except inside these exact sequences.
 const SAFE_KEY_SEQUENCES: readonly (readonly string[])[] = [

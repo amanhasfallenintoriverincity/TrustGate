@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
+import { rmSync, symlinkSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import type { AnalysisPlan, ExecutionResult } from "@trustgate/contracts";
+import type { FastifyInstance } from "fastify";
 
 import { createRunReport, type RunReport } from "../src/report.js";
 import {
   buildServer,
+  isRepoPathAllowedInRoot,
   type RunLogRecord,
   type WorkspacePipeline,
   type WorkspacePipelineFactory,
@@ -527,6 +531,193 @@ test("a second concurrent run is rejected with 409 and the gate reopens", async 
   await app.close();
 });
 
+test("the run gate admits exactly one concurrent workspace request", async () => {
+  const scratch = process.env.TMPDIR ?? tmpdir();
+  const root = await mkdtemp(join(scratch, "trustgate-server-gate-"));
+  await mkdir(join(root, "apps", "demo-target"), { recursive: true });
+
+  const gateBypassed = createDeferred();
+  const release = createDeferred();
+  let executorStarts = 0;
+  let running = 0;
+  let maxConcurrent = 0;
+  const app = buildServer({
+    mode: "workspace",
+    rootDir: root,
+    executeRun: async (task) => {
+      executorStarts += 1;
+      if (executorStarts > 1) gateBypassed.resolve();
+      running += 1;
+      maxConcurrent = Math.max(maxConcurrent, running);
+      try {
+        await release.promise;
+      } finally {
+        running -= 1;
+      }
+      return makeReport(task.runId);
+    },
+  });
+
+  try {
+    const payload = { source: "workspace", repoPath: "apps/demo-target" };
+    const firstRequest = app.inject({ method: "POST", url: "/api/runs", payload });
+    const secondRequest = app.inject({ method: "POST", url: "/api/runs", payload });
+
+    // Event-driven, never sleep-driven: either a request answers (gate held: one 409) or the
+    // slow executor is entered twice (gate bypassed). Every wait is bounded by a real timer.
+    const decision = await withTimeout(
+      Promise.race([
+        firstRequest.then((response) => `first:${response.statusCode}`),
+        secondRequest.then((response) => `second:${response.statusCode}`),
+        gateBypassed.promise.then(() => "gate-bypassed"),
+      ]),
+      "gate decision",
+    );
+    release.resolve();
+
+    const responses = await withTimeout(
+      Promise.all([firstRequest, secondRequest]),
+      "both workspace requests",
+    );
+    const statuses = responses
+      .map((response) => response.statusCode)
+      .sort((left, right) => left - right);
+    assert.deepEqual(
+      statuses,
+      [201, 409],
+      `both concurrent workspace requests ran (${decision}, executorStarts ${executorStarts}, maxConcurrent ${maxConcurrent})`,
+    );
+    assert.deepEqual(
+      responses.find((response) => response.statusCode === 409)?.json(),
+      { error: "run already in progress" },
+    );
+    assert.equal(
+      responses.find((response) => response.statusCode === 201)?.json().source,
+      "workspace",
+    );
+    assert.equal(executorStarts, 1);
+    assert.equal(maxConcurrent, 1);
+
+    const third = await app.inject({ method: "POST", url: "/api/runs", payload });
+    assert.equal(third.statusCode, 201);
+    assert.equal(executorStarts, 2);
+  } finally {
+    release.resolve();
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a rejected repository path does not leave the run gate closed", async () => {
+  const scratch = process.env.TMPDIR ?? tmpdir();
+  const root = await mkdtemp(join(scratch, "trustgate-server-gate-release-"));
+  await mkdir(join(root, "apps", "demo-target"), { recursive: true });
+  const app = buildServer({
+    mode: "workspace",
+    rootDir: root,
+    executeRun: async (task) => makeReport(task.runId),
+  });
+
+  try {
+    for (const repoPath of ["../outside", "missing-directory", "/etc"]) {
+      const rejected = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        payload: { source: "workspace", repoPath },
+      });
+      assert.equal(rejected.statusCode, 400, `expected 400 for ${repoPath}`);
+      assert.deepEqual(rejected.json(), { error: "invalid repository path" });
+
+      const next = await app.inject({
+        method: "POST",
+        url: "/api/runs",
+        payload: { source: "workspace", repoPath: "apps/demo-target" },
+      });
+      assert.equal(next.statusCode, 201, `gate stayed closed after ${repoPath}`);
+    }
+  } finally {
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failing run releases the gate for the next request", async () => {
+  let attempts = 0;
+  const app = buildServer({
+    mode: "fixture",
+    executeRun: async (task) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("executor exploded");
+      return makeReport(task.runId);
+    },
+  });
+
+  try {
+    const failed = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "fixture" },
+    });
+    assert.equal(failed.statusCode, 500);
+    assert.deepEqual(failed.json(), { error: "run failed" });
+
+    const next = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "fixture" },
+    });
+    assert.equal(next.statusCode, 201);
+    assert.equal(attempts, 2);
+  } finally {
+    await app.close();
+  }
+});
+
+test("body validation still wins over the gate while a run is in flight", async () => {
+  const started = createDeferred();
+  const release = createDeferred();
+  const app = buildServer({
+    mode: "workspace",
+    executeRun: async (task) => {
+      started.resolve();
+      await release.promise;
+      return makeReport(task.runId);
+    },
+  });
+
+  try {
+    const firstRequest = app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "fixture" },
+    });
+    await withTimeout(started.promise, "in-flight run");
+
+    const badBody = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "fixture", unexpected: true },
+    });
+    assert.equal(badBody.statusCode, 400);
+    assert.deepEqual(badBody.json(), { error: "invalid request" });
+
+    const badPath = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "../outside" },
+    });
+    assert.equal(badPath.statusCode, 409);
+    assert.deepEqual(badPath.json(), { error: "run already in progress" });
+
+    release.resolve();
+    const first = await withTimeout(firstRequest, "first run");
+    assert.equal(first.statusCode, 201);
+  } finally {
+    release.resolve();
+    await app.close();
+  }
+});
+
 test("workspace runtime failures stay generic and unavailable ones are 503", async () => {
   const scratch = process.env.TMPDIR ?? tmpdir();
   const root = await mkdtemp(join(scratch, "trustgate-server-failure-"));
@@ -653,5 +844,217 @@ test("logs and responses never carry secrets, prompts, or host paths", async () 
   } finally {
     await app.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+type RawResponse = { statusLine: string; body: string; text: string };
+
+/** Writes one raw HTTP request and returns everything the server sent back. */
+const sendRawRequest = async (port: number, request: string): Promise<RawResponse> => {
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+    socket.once("connect", () => socket.write(request));
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.once("end", () => finish());
+    socket.once("close", () => finish());
+    socket.once("error", (error) => finish(error));
+  });
+  const text = Buffer.concat(chunks).toString("utf8");
+  const [head, ...rest] = text.split("\r\n\r\n");
+  return {
+    statusLine: (head ?? "").split("\r\n")[0] ?? "",
+    body: rest.join("\r\n\r\n"),
+    text,
+  };
+};
+
+const listenOnEphemeralPort = async (app: FastifyInstance): Promise<number> => {
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  if (address === null || typeof address === "string") {
+    return assert.fail("server is not listening on a TCP port");
+  }
+  return address.port;
+};
+
+test("parse-level client errors answer with fixed JSON and no framework text", async () => {
+  const secret = fakeSecret("sk-", "Z".repeat(24));
+  const records: RunLogRecord[] = [];
+  const app = buildServer({ mode: "fixture", log: (record) => records.push(record) });
+
+  try {
+    const port = await listenOnEphemeralPort(app);
+    const probes = [
+      {
+        name: "oversized header",
+        status: 431,
+        request: `GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ${secret}${"p".repeat(20_000)}\r\n\r\n`,
+      },
+      {
+        name: "invalid header token",
+        status: 400,
+        request: `GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n${secret} value\r\n\r\n`,
+      },
+      {
+        name: "unsupported request version",
+        status: 400,
+        request: "GET /health HTTP/1.2\r\nHost: 127.0.0.1\r\n\r\n",
+      },
+    ];
+
+    const statuses: number[] = [];
+    for (const probe of probes) {
+      const response = await withTimeout(
+        sendRawRequest(port, probe.request),
+        probe.name,
+      );
+      assert.match(
+        response.statusLine,
+        new RegExp(`^HTTP/1\\.1 ${probe.status} `),
+        `${probe.name} status line`,
+      );
+      // Raw socket probe: the parser-level path never reaches the router, so this asserts on the
+      // bytes Fastify's own default handler would have filled with framework internals.
+      assert.equal(response.body, '{"error":"invalid request"}', `${probe.name} body`);
+      assert.ok(!response.text.includes(secret), `${probe.name} echoed the request`);
+      assert.ok(!response.text.includes("pppppppppp"), `${probe.name} echoed the padding`);
+      assert.ok(!response.text.includes("GET /health"), `${probe.name} echoed the request line`);
+      assert.ok(
+        !/Exceeded maximum allowed HTTP header size|Client Error|"message"/.test(
+          response.text,
+        ),
+        `${probe.name} leaked framework internals`,
+      );
+      assertClean(response.text, `${probe.name} response`, [process.cwd()]);
+      statuses.push(probe.status);
+    }
+    assert.deepEqual(statuses, [431, 400, 400]);
+
+    // Parse-level failures must not degrade the server for later requests.
+    const health = await app.inject({ method: "GET", url: "/health" });
+    assert.equal(health.statusCode, 200);
+
+    for (const record of records) {
+      for (const key of Object.keys(record)) {
+        assert.ok(LOG_RECORD_KEYS.has(key), `unexpected log field ${key}`);
+      }
+    }
+    assert.deepEqual(
+      records
+        .filter((record) => record.event === "request.rejected")
+        .map((record) =>
+          record.event === "request.rejected" ? record.statusCode : 0,
+        ),
+      [431, 400, 400],
+    );
+  } finally {
+    await app.close();
+  }
+});
+
+test("accepted repository paths are re-validated against the root", async () => {
+  const scratch = process.env.TMPDIR ?? tmpdir();
+  const root = await mkdtemp(join(scratch, "trustgate-server-recheck-"));
+  const outside = await mkdtemp(join(scratch, "trustgate-server-recheck-outside-"));
+  const accepted = join(root, "target");
+
+  try {
+    await mkdir(accepted, { recursive: true });
+    assert.equal(await isRepoPathAllowedInRoot(root, accepted), true);
+
+    // The checked directory is replaced by a symlink that escapes the root.
+    await rm(accepted, { recursive: true });
+    await symlink(outside, accepted);
+    assert.equal(await isRepoPathAllowedInRoot(root, accepted), false);
+
+    // A file is not a repository directory, and nothing outside the root ever passes.
+    await writeFile(join(root, "file"), "trustgate\n", "utf8");
+    assert.equal(await isRepoPathAllowedInRoot(root, join(root, "file")), false);
+    assert.equal(await isRepoPathAllowedInRoot(root, outside), false);
+    assert.equal(await isRepoPathAllowedInRoot(root, join(root, "missing")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("a path swapped after acceptance is rejected before the pipeline is built", async () => {
+  const scratch = process.env.TMPDIR ?? tmpdir();
+  const root = await mkdtemp(join(scratch, "trustgate-server-swap-"));
+  const outside = await mkdtemp(join(scratch, "trustgate-server-swap-outside-"));
+  await mkdir(join(root, "stable"), { recursive: true });
+  await mkdir(join(root, "target"), { recursive: true });
+
+  let swapArmed = false;
+  let pipelineBuilt = 0;
+  const records: RunLogRecord[] = [];
+  const app = buildServer({
+    mode: "workspace",
+    rootDir: root,
+    createWorkspacePipeline: () => {
+      pipelineBuilt += 1;
+      return createPipeline();
+    },
+    log: (record) => {
+      records.push(record);
+      // The handler logs acceptance after resolving the path and before the executor runs, so the
+      // swap below lands exactly inside the window that the pre-pipeline re-validation closes.
+      if (swapArmed && record.event === "run.accepted") {
+        rmSync(join(root, "target"), { recursive: true, force: true });
+        symlinkSync(outside, join(root, "target"));
+      }
+    },
+  });
+
+  try {
+    const stable = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "stable" },
+    });
+    assert.equal(stable.statusCode, 201);
+    assert.equal(pipelineBuilt, 1);
+
+    swapArmed = true;
+    const swapped = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "target" },
+    });
+    assert.equal(swapped.statusCode, 400);
+    assert.deepEqual(swapped.json(), { error: "invalid repository path" });
+    assert.equal(pipelineBuilt, 1, "the pipeline ran on a path that left the root");
+    assert.ok(!swapped.body.includes(root), "swapped response echoed the root");
+    assert.ok(!swapped.body.includes(outside), "swapped response echoed the swap target");
+    assert.deepEqual(
+      records
+        .filter((record) => record.event === "run.rejected")
+        .map((record) =>
+          record.event === "run.rejected" ? record.reason : "",
+        ),
+      ["invalid_repo_path"],
+    );
+
+    // The re-validation failure releases the gate for the next request.
+    const afterSwap = await app.inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { source: "workspace", repoPath: "stable" },
+    });
+    assert.equal(afterSwap.statusCode, 201);
+    assert.equal(pipelineBuilt, 2);
+  } finally {
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });

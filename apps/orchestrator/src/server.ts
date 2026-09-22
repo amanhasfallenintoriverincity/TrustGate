@@ -13,6 +13,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
+import { STATUS_CODES } from "node:http";
+import type { Socket } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +27,7 @@ import {
 } from "@trustgate/contracts";
 import { createLlmClient, LlmGatewayError } from "@trustgate/llm-gateway";
 import Fastify, {
+  type ConnectionError,
   type FastifyError,
   type FastifyInstance,
   type FastifyRequest,
@@ -92,7 +95,8 @@ export type RunLogRecord =
       statusCode: number;
       durationMs: number;
     }
-  | { event: "run.rejected"; reason: RejectionReason };
+  | { event: "run.rejected"; reason: RejectionReason }
+  | { event: "request.rejected"; reason: "client_error"; statusCode: number };
 
 export type BuildServerOptions = {
   /** Server mode. `workspace` (default) also accepts fixture requests. */
@@ -371,6 +375,64 @@ const hasTraversalSegment = (candidate: string): boolean =>
   candidate.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..");
 
 /**
+ * Real-path containment check: `target` must exist, resolve (symlinks included) inside the
+ * allowlist root, and stay a directory. Shared by request-time normalization and the
+ * pre-pipeline re-validation so both enforce exactly the same rules.
+ */
+const resolveRealPathInsideRoot = async (
+  rootDir: string,
+  target: string,
+): Promise<string | undefined> => {
+  try {
+    const root = await realpath(rootDir);
+    if (!(await stat(root)).isDirectory()) return undefined;
+    if (!isInside(root, target)) return undefined;
+    const resolved = await realpath(target);
+    if (!isInside(root, resolved)) return undefined;
+    if (!(await stat(resolved)).isDirectory()) return undefined;
+    return resolved;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Raised when an accepted repository path stops resolving inside the root before execution. */
+export class InvalidRepoPathError extends Error {
+  constructor() {
+    super("repository path is no longer allowed");
+    this.name = "InvalidRepoPathError";
+  }
+}
+
+/**
+ * Re-validates a repository path that was already accepted, immediately before the executor
+ * hands it to the pipeline (symlink swap, rename, or deletion after the request-time check).
+ *
+ * Residual TOCTOU window: this check and the pipeline's first filesystem call are still
+ * separate operations, so a fully race-free design needs an open dirfd plus O_NOFOLLOW
+ * traversal. The window narrows from "request arrival" to "pipeline creation" here.
+ */
+export const isRepoPathAllowedInRoot = async (
+  rootDir: string,
+  repoPath: string,
+): Promise<boolean> =>
+  (await resolveRealPathInsideRoot(rootDir, repoPath)) !== undefined;
+
+/** Wraps a pipeline factory with the pre-execution re-validation above. */
+export const createReverifiedPipelineFactory = (
+  rootDir: string,
+  createWorkspacePipeline: WorkspacePipelineFactory,
+): WorkspacePipelineFactory =>
+  async function reverifiedPipelineFactory(task) {
+    if (task.source === "workspace" && task.repoPath !== undefined) {
+      if (!(await isRepoPathAllowedInRoot(rootDir, task.repoPath))) {
+        throw new InvalidRepoPathError();
+      }
+    }
+    return createWorkspacePipeline(task);
+  };
+
+/**
  * Normalizes a repo-relative path into the allowlisted root: absolute paths, `.`/`..`
  * segments, empty segments, backslashes, and symlinks escaping the root are all
  * rejected, so a request can never point the pipeline outside of `rootDir`.
@@ -385,13 +447,9 @@ const resolveWorkspaceRepoPath = async (
   }
   try {
     const root = await realpath(rootDir);
-    if (!(await stat(root)).isDirectory()) return { ok: false };
     const target = candidate === undefined ? root : join(root, candidate);
-    if (!isInside(root, target)) return { ok: false };
-    const resolved = await realpath(target);
-    if (!isInside(root, resolved)) return { ok: false };
-    if (!(await stat(resolved)).isDirectory()) return { ok: false };
-    return { ok: true, path: resolved };
+    const resolved = await resolveRealPathInsideRoot(rootDir, target);
+    return resolved === undefined ? { ok: false } : { ok: true, path: resolved };
   } catch {
     return { ok: false };
   }
@@ -413,6 +471,15 @@ const readStatusCode = (error: unknown): number => {
   return 500;
 };
 
+const clientErrorStatus = (error: ConnectionError): number => {
+  if (error.code === "HPE_HEADER_OVERFLOW") return 431;
+  if (error.code === "ERR_HTTP_REQUEST_TIMEOUT") return 408;
+  return 400;
+};
+
+/** Fixed payload for parse-level failures; never carries request or framework text. */
+const CLIENT_ERROR_BODY = JSON.stringify(INVALID_REQUEST);
+
 export const buildServer = (options: BuildServerOptions = {}): FastifyInstance => {
   const mode = options.mode ?? "workspace";
   const rootDir = options.rootDir ?? DEFAULT_ROOT_DIR;
@@ -420,7 +487,11 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
   const createWorkspacePipeline =
     options.createWorkspacePipeline ?? createDefaultWorkspacePipeline;
   const executeRun =
-    options.executeRun ?? createDefaultExecutor(createWorkspacePipeline);
+    options.executeRun ??
+    createDefaultExecutor(
+      // The default executor re-validates the accepted path right before the pipeline runs.
+      createReverifiedPipelineFactory(rootDir, createWorkspacePipeline),
+    );
 
   const runs = new Map<string, RunResponse>();
   let inFlight = false;
@@ -437,6 +508,26 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
     logger: false,
     bodyLimit: BODY_LIMIT_BYTES,
     routerOptions: { maxParamLength: MAX_PARAM_LENGTH },
+    // Parse-level failures (oversized headers, bad request lines) never reach the router, so
+    // Fastify's default handler answers with framework internals ("Exceeded maximum allowed HTTP
+    // header size", "Client Error") and the raw request text. Answer with a fixed body instead
+    // and keep the record to non-sensitive metadata.
+    clientErrorHandler: (error: ConnectionError, socket: Socket) => {
+      const statusCode = clientErrorStatus(error);
+      log?.({ event: "request.rejected", reason: "client_error", statusCode });
+      if (socket.destroyed || !socket.writable) {
+        socket.destroy();
+        return;
+      }
+      socket.end(
+        `HTTP/1.1 ${statusCode} ${STATUS_CODES[statusCode] ?? "Error"}\r\n` +
+          "content-type: application/json; charset=utf-8\r\n" +
+          `content-length: ${Buffer.byteLength(CLIENT_ERROR_BODY)}\r\n` +
+          "connection: close\r\n" +
+          "\r\n" +
+          CLIENT_ERROR_BODY,
+      );
+    },
     // Framework-level failures (oversized params, malformed URLs) otherwise answer with
     // the raw request path; responding generically keeps request text out of replies.
     frameworkErrors: (
@@ -480,28 +571,32 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
       log?.({ event: "run.rejected", reason: parsed.reason });
       return reply.status(400).send(INVALID_REQUEST);
     }
+    // The gate is checked and claimed in one synchronous block, before any await: workspace
+    // requests resolve their path asynchronously, and a claim made after that await lets two
+    // concurrent requests run in parallel. Body parsing stays ahead of the gate so malformed
+    // bodies are still 400 while a run is in flight.
     if (inFlight) {
       log?.({ event: "run.rejected", reason: "run_in_progress" });
       return reply.status(409).send(RUN_IN_PROGRESS);
     }
-
-    let repoPath: string | undefined;
-    if (parsed.task.source === "workspace") {
-      const resolved = await resolveWorkspaceRepoPath(
-        rootDir,
-        parsed.task.repoPath,
-      );
-      if (!resolved.ok) {
-        log?.({ event: "run.rejected", reason: "invalid_repo_path" });
-        return reply.status(400).send(INVALID_REPO_PATH);
-      }
-      repoPath = resolved.path;
-    }
+    inFlight = true;
 
     const runId = `run-${randomUUID()}`;
-    inFlight = true;
     const startedAt = Date.now();
     try {
+      let repoPath: string | undefined;
+      if (parsed.task.source === "workspace") {
+        const resolved = await resolveWorkspaceRepoPath(
+          rootDir,
+          parsed.task.repoPath,
+        );
+        if (!resolved.ok) {
+          log?.({ event: "run.rejected", reason: "invalid_repo_path" });
+          return reply.status(400).send(INVALID_REPO_PATH);
+        }
+        repoPath = resolved.path;
+      }
+
       const task: RunTask = {
         runId,
         source: parsed.task.source,
@@ -526,6 +621,11 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
         .header("cache-control", "no-store")
         .send(response);
     } catch (error) {
+      if (error instanceof InvalidRepoPathError) {
+        // The accepted path stopped resolving inside the root before the pipeline ran.
+        log?.({ event: "run.rejected", reason: "invalid_repo_path" });
+        return reply.status(400).send(INVALID_REPO_PATH);
+      }
       if (isUnavailable(error)) {
         log?.({ event: "run.rejected", reason: "workspace_unavailable" });
         return reply.status(503).send(WORKSPACE_UNAVAILABLE);

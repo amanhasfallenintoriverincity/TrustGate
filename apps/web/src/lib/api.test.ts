@@ -108,6 +108,40 @@ describe("startFixtureRun 오류 문구", () => {
   });
 });
 
+describe("startFixtureRun 네트워크 실패", () => {
+  it("fetch가 TypeError로 실패하면 고정 한국어 문구로 바꾼다", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+
+    await expect(startFixtureRun(fetcher)).rejects.toThrow("분석 서버에 연결하지 못했습니다");
+  });
+
+  it("브라우저 원문 영어 문구를 오류 메시지에 노출하지 않는다", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+
+    await expect(startFixtureRun(fetcher)).rejects.not.toThrow(/Failed to fetch/);
+  });
+
+  it("Error가 아닌 값으로 실패해도 같은 고정 문구를 쓴다", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => {
+      throw "network down";
+    });
+
+    await expect(startFixtureRun(fetcher)).rejects.toThrow("분석 서버에 연결하지 못했습니다");
+  });
+
+  it("전송 중단(AbortError)도 연결 실패 문구로 알린다", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => {
+      throw Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+    });
+
+    await expect(startFixtureRun(fetcher)).rejects.toThrow("분석 서버에 연결하지 못했습니다");
+  });
+});
+
 describe("startFixtureRun 응답 가드", () => {
   it("JSON이 아니면 형식 오류로 알린다", async () => {
     const fetcher = vi.fn<FetchLike>(async () => new Response("<html>nope</html>", { status: 201 }));

@@ -6,6 +6,8 @@
  * - 성공: 201 + `RunReport & { source }` (`cache-control: no-store`)
  * - 오류: 400/409/500/503 고정 바디. 바디 문자열은 신뢰 경계 밖이라 그대로 노출하지 않고
  *   상태 코드별 고정 한국어 문구로 바꿉니다.
+ * - 네트워크 실패: 전송 계층 예외(`TypeError: Failed to fetch`처럼 브라우저마다 다른 원문)도
+ *   그대로 흘리지 않고 네트워크 고정 한국어 문구로 바꿉니다.
  *
  * 타입은 orchestrator 소스의 `report.ts`/`contracts` 구조에서 웹이 실제로 읽는 필드만
  * 서브셋으로 옮긴 것입니다. 워크스페이스 패키지를 직접 import하면 웹 번들에 Node 의존성이
@@ -94,6 +96,13 @@ const RUN_ENDPOINT = "/api/runs";
 const FIXTURE_REQUEST_BODY = JSON.stringify({ source: "fixture" });
 const INVALID_RESPONSE_MESSAGE = "응답 형식이 올바르지 않습니다";
 
+/**
+ * 전송 계층 실패용 고정 문구입니다. `fetch`가 네트워크 단절·DNS 실패·CORS 차단 등에서 던지는
+ * 예외는 브라우저마다 문구가 다르고(예: `TypeError: Failed to fetch`) 영어 원문이 그대로
+ * 사용자에게 노출되므로, 상태 코드 문구와 같은 방식으로 고정 한국어 문구만 씁니다.
+ */
+const CONNECTION_MESSAGE = "분석 서버에 연결하지 못했습니다";
+
 /** 서버가 보낸 문장을 그대로 읽지 않고 상태 코드별 고정 문구만 씁니다. */
 const STATUS_MESSAGES: Readonly<Record<number, string>> = {
   400: "요청이 거부되었습니다",
@@ -128,15 +137,22 @@ const parseRunResponse = (value: unknown): RunResponse => {
  *
  * `fetcher`는 기본값이 전역 `fetch`입니다. dev 서버에서는 vite의 `/api` 프록시가
  * 오케스트레이터로 넘기므로 절대 URL이 필요 없습니다.
+ *
+ * 전송 계층에서 던져진 예외는 내용을 보지 않고 `CONNECTION_MESSAGE`로만 바꿉니다.
  */
 export const startFixtureRun = async (
   fetcher: FetchLike = (input, init) => fetch(input, init),
 ): Promise<RunResponse> => {
-  const response = await fetcher(RUN_ENDPOINT, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: FIXTURE_REQUEST_BODY,
-  });
+  let response: Response;
+  try {
+    response = await fetcher(RUN_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: FIXTURE_REQUEST_BODY,
+    });
+  } catch {
+    throw new Error(CONNECTION_MESSAGE);
+  }
 
   if (!response.ok) throw new Error(failureMessage(response.status));
 

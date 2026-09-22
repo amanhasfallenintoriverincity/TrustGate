@@ -24,6 +24,15 @@ const PODMAN_EXECUTABLE = "/usr/bin/podman";
 const SANDBOX_IMAGE = "localhost/trustgate-target:sandbox";
 
 /**
+ * Mirrors the runner's `PODMAN_TIMEOUT_MS` (`src/sandbox-runner.ts:36`) — it is
+ * not exported, so the literal is repeated here. The preflight probes the same
+ * trust-boundary binary the runner executes, so a wedged binary must surface as
+ * `podman executable unavailable: …` within the same budget instead of hanging
+ * the test forever.
+ */
+const PREFLIGHT_TIMEOUT_MS = 30_000;
+
+/**
  * The runner rejects a run whenever the Podman process leaves a single byte on
  * stderr and may only report the generic `sandbox execution failed` — putting
  * stderr content into that message is forbidden by the security contract (see
@@ -46,7 +55,7 @@ test(
     const probe = spawnSync(
       PODMAN_EXECUTABLE,
       ["image", "inspect", SANDBOX_IMAGE, "--format", "{{.Id}}"],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: PREFLIGHT_TIMEOUT_MS },
     );
     assert.equal(
       probe.error,
@@ -91,7 +100,9 @@ test(
 
     // Brief §5: every recorded pair is CONFIRMED → BLOCKED, i.e. FIXED. The
     // expected regression column is derived from the fixture (one pair per
-    // recorded result), never hand-copied.
+    // recorded result), never hand-copied. `classifyRegression` pairs the two
+    // live runs by index, so their lengths must agree before deriving the column.
+    assert.equal(vulnerable.length, patched.length);
     assert.deepEqual(
       vulnerable.map((result, index) =>
         classifyRegression(result.verdict, patched[index]!.verdict),

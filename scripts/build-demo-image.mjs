@@ -17,7 +17,10 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const containerfile = "apps/demo-target/Containerfile.sandbox";
 const image = "localhost/trustgate-target:sandbox";
-const podman = process.env.PODMAN_BIN ?? "podman";
+// `PODMAN_BIN=""` (or blank) must not reach `spawnSync`: an empty `file`
+// argument throws `ERR_INVALID_ARG_VALUE`, so empty/whitespace-only values are
+// demoted to the PATH default exactly like an unset variable.
+const podman = process.env.PODMAN_BIN?.trim() || "podman";
 
 const fail = (message) => {
   process.stderr.write(`build-demo-image: ${message}\n`);

@@ -31,12 +31,14 @@ import { describe, expect, it } from "vitest";
 // 정적으로 잡지 못하는 것(의도한 한계):
 //   · `all: revert`/`all: unset` 같은 캐스케이드 무력화의 일반형. 아래 all 검사는
 //     줄바꿈 대상 요소에 한정한 좁은 그물입니다(전부 잡으려면 실브라우저 계산값 비교).
-//   · 정적으로 값이 정해지지 않는 트랙: `calc()`·`clamp()`·`var()`·`min()`/`max()`·
-//     `fit-content()`는 허용합니다(예: `min(320px, 1fr)`처럼 실제로는 줄어들지 않는 식도
-//     통과). 맨 절대 길이(`320px`·`20rem`·`50vw`)와 그런 트랙이 든 `repeat()`만 잡습니다.
-//   · 비정규 트랙 토큰: 지수 표기(`1e2px`)·퍼센트 트랙(`300%`)처럼 단위 문자로 끝나지
-//     않는 표기는 맨 절대 길이 토큰으로 인식되지 않습니다(관용적 CSS 표기가 아니며,
-//     `%`는 컨테이너 기준이라 애초에 고정 폭으로 다루지 않습니다).
+//   · 정적 스캐너가 단일 고정 트랙으로 단정하지 않아 허용하는 값: `calc()`·`clamp()`·
+//     `var()`·`min()`/`max()`·`fit-content()`. 상·하한이 정적으로 정해질 수도 있지만 식
+//     자체는 줄어들 수 있어 의도적으로 허용합니다(예: `min(320px, 1fr)`처럼 줄어들지 않는
+//     식도 통과). 맨 절대 길이(`320px`·`20rem`·`50vw`)와 그런 트랙이 든 `repeat()`만
+//     잡습니다.
+//   · 토큰 스캐너가 맨 절대 길이로 읽지 않는 표기: 지수 표기(`1e2px`)는 숫자 뒤 단위
+//     자리에 숫자가 끼어 있어(`e2px`) 인식되지 않고, 퍼센트 트랙(`300%`)은 `%`가 문자
+//     단위가 아니라 인식되지 않습니다(`%`는 컨테이너 기준이라 애초에 고정 폭이 아닙니다).
 //   · 셀렉터 표기 변형: CSS 이스케이프(`.\61 ction-notice`), 속성 셀렉터
 //     (`[class~="action-notice"]`·`[role="status"]`)는 서브스트링 판정 밖입니다.
 //     둘 다 비관용적이라 사고로 생길 수 있는 형태가 아닙니다.
@@ -45,8 +47,13 @@ import { describe, expect, it } from "vitest";
 //   · 시각적 숨김 레시피 목록(clip-path·position·1px·overflow) 밖의 숨김 기법:
 //     `transform`·`opacity`·`filter`·`height: 0` 등은 이 계약의 사정권이 아닙니다.
 //
-// `:empty` 규칙에 레시피 밖 선언이 하나라도 더 있으면 unmetSteps가 잡습니다. 이건 의도된
-// 엄격성입니다(빈 라이브 리전은 "남겨 두되 화면에서만 지운다"는 레시피 자체가 계약).
+// `:empty` 규칙은 두 겹으로 막습니다 — 레시피 단계의 누락·오값은 unmetSteps가, 같은
+// 규칙에 붙는 노드 제거 선언(`display: none`·`visibility: hidden`·
+// `visibility: collapse`)은 nodeRemovers가 잡습니다. 그 밖의 여분 선언(위 시각적 숨김
+// 기법 목록의 `opacity`·`transform` 등)은 AX 노드를 유지하므로 허용합니다. 예:
+// `opacity: 0`·`transform: scale(0)`만 더한 `.action-notice:empty`는 green, 거기에
+// `display: none`을 더하면 red입니다. 빈 라이브 리전은 "남겨 두되 화면에서만 지운다"는
+// 레시피 자체가 계약이라 이 두 겹은 의도된 엄격성입니다.
 //
 // 파서는 정규식이 아니라 postcss AST입니다. 정규식 파서는 CSS 중첩
 // (`.app-shell { … .action-notice:empty { display: none } }`), prefix 셀렉터

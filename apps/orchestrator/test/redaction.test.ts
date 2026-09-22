@@ -406,3 +406,234 @@ test("keeps the single scheme prefix on the existing fast path", () => {
   assert.equal(redact(`Bearer ${token}`), "Bearer [REDACTED]");
   assert.equal(redact(redact(single)), redact(single));
 });
+
+
+
+// ---------------------------------------------------------------------------------------------
+// Round 2 hardening (written RED first): encoded surroundings, scheme chains after a redacted
+// body, a linear path scan, the sensitive-key vocabulary, sink parity and fail-closed records.
+// Every credential literal below is assembled at runtime, so the file holds no real-looking value.
+// ---------------------------------------------------------------------------------------------
+
+/** Joins credential fragments: keeps the literals out of the file and out of any log. */
+const r2Join = (...parts: readonly string[]): string => parts.join("");
+const r2Ghp = r2Join("gh", "p_", "A".repeat(36));
+const r2GhpAlt = r2Join("gh", "p_", "B".repeat(36));
+const r2Anthropic = r2Join("sk", "-ant-", "C".repeat(36));
+const r2Jwt = r2Join("ey", "J", "D".repeat(60));
+const r2Aws = r2Join("AK", "IA", "E".repeat(16));
+const r2Raw = r2Join("S3cr3t", "V4lue", "-", "DoNotLeak", "-9f2b");
+const r2Run = "F".repeat(30);
+const r2Short = r2Join("hunt", "er2");
+
+test("removes a credential written inside an encoded surrounding", () => {
+  const cases: readonly (readonly [string, string])[] = [
+    ["encoded-authorization-token", r2Join("Authorization", "%3A%20Bearer%20", r2Ghp)],
+    ["encoded-redacted-then-token", r2Join("Authorization", "%3A%20Bearer%20[REDACTED]%20", r2Anthropic)],
+    ["encoded-sk-body", r2Join("%20", r2Anthropic)],
+    ["encoded-separator-assignment", r2Join("x", "%3D%20", r2Aws)],
+    ["encoded-json-web-token", r2Join("jwt", "%3D%20", r2Jwt)],
+    ["encoded-bare-scheme", r2Join("Bearer", "%20", r2GhpAlt)],
+    ["encoded-path-prefix", r2Join("path", "%2F", r2Ghp)],
+  ];
+
+  for (const [name, line] of cases) {
+    const output = redact(line);
+    assertNoSecret(output, [r2Ghp, r2GhpAlt, r2Anthropic, r2Jwt, r2Aws], name);
+    assert.ok(output.includes(REDACTED), `${name} was not redacted at all`);
+    assert.equal(redact(output), output, `${name} is not idempotent`);
+  }
+});
+
+test("keeps redacting the credential that follows an already redacted scheme body", () => {
+  const cases: readonly (readonly [string, string])[] = [
+    ["bearer-token-body", `Authorization: Bearer [REDACTED] ${r2Run}`],
+    ["bearer-raw-body", `Authorization: Bearer [REDACTED] ${r2Raw}`],
+    ["basic-raw-body", `authorization: basic [REDACTED] ${r2Raw}`],
+    ["doubled-scheme-chain", `Authorization: Bearer [REDACTED] Bearer ${r2Raw}`],
+    ["json-quoted-chain", `{"route":"Authorization: Bearer [REDACTED] ${r2Run}"}`],
+  ];
+
+  for (const [name, line] of cases) {
+    const output = redact(line);
+    assertNoSecret(output, [r2Run, r2Raw], name);
+    assert.ok(output.includes(REDACTED), `${name} was not redacted at all`);
+    assert.equal(redact(output), output, `${name} is not idempotent`);
+  }
+
+  // The chain keeps its shape: the marker stays, only the body after it is replaced.
+  assert.equal(
+    redact(`Authorization: Bearer [REDACTED] ${r2Raw}`),
+    `Authorization: Bearer [REDACTED] ${REDACTED}`,
+  );
+});
+
+test("scans credential paths linearly and bounds the widened window", () => {
+  const pathological = ".".repeat(64 * 1024);
+  const started = process.hrtime.bigint();
+  const untouched = redact(pathological);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+  assert.equal(untouched, pathological, "a benign run was rewritten");
+  assert.ok(elapsedMs < 2000, `a 64KB pathological line took ${elapsedMs.toFixed(0)}ms`);
+
+  const markers = [".codex/auth.json", ".ssh/id_rsa", ".aws/credentials", ".netrc", ".codex\\auth.json"];
+  for (const marker of markers) {
+    const output = redact(`reading /home/alice/${marker} failed`);
+    assertNoSecret(output, [marker], `marker ${marker}`);
+    assert.ok(output.includes("reading "), `marker ${marker} mangled its context`);
+    assert.ok(output.includes(" failed"), `marker ${marker} mangled its context`);
+    assert.equal(redact(output), output, `marker ${marker} is not idempotent`);
+  }
+
+  // The widening pass is capped at the window: a marker inside a 2KB run removes at most that.
+  const long = `${"a".repeat(2048)}/.codex/auth.json`;
+  const bounded = redact(long);
+  assertNoSecret(bounded, [".codex"], "window cap");
+  assert.ok(
+    bounded.length >= long.length - (2 * 512 + ".codex/auth.json".length),
+    "the scanner widened past its window",
+  );
+});
+
+test("redacts values under sensitive key names in records and in lines", () => {
+  const received: unknown[] = [];
+  const sink = createRedactingSink<Record<string, unknown>>((record) => {
+    received.push(record);
+  });
+
+  const keys = [
+    "apiKey",
+    "accessToken",
+    "refreshToken",
+    "clientSecret",
+    "sessionToken",
+    "authToken",
+    "PASS",
+    "PWD",
+    "CREDS",
+    "BEARER",
+    "COOKIE",
+    "x-api-key",
+  ];
+
+  for (const key of keys) {
+    const record = { event: "e", [key]: r2Short };
+    sink(record);
+    const observed = JSON.stringify(received[received.length - 1]);
+    assert.equal(observed.includes(r2Short), false, `the sink leaked the value of ${key}`);
+    assert.equal(serializeLogLine(record).includes(r2Short), false, `the line leaked the value of ${key}`);
+  }
+
+  sink({ event: "e", auth: { accessToken: r2Short } });
+  assert.equal(
+    JSON.stringify(received[received.length - 1]).includes(r2Short),
+    false,
+    "a nested sensitive key leaked",
+  );
+});
+
+test("redacts credentials inside URL userinfo", () => {
+  const cases: readonly (readonly [string, string])[] = [
+    ["https-userinfo", `https://alice:${r2Raw}@example.com/health`],
+    ["plus-scheme-userinfo", `git+ssh://bob:${r2Raw}@example.com/repo.git`],
+    ["token-userinfo", `https://${r2Ghp}@example.com/health`],
+  ];
+
+  for (const [name, line] of cases) {
+    const output = redact(line);
+    assertNoSecret(output, [r2Raw, r2Ghp], name);
+    assert.ok(output.includes("@example.com"), `${name} mangled the host`);
+    assert.equal(redact(output), output, `${name} is not idempotent`);
+  }
+});
+
+test("fails closed at the record sink instead of leaking or dropping", () => {
+  const received: unknown[] = [];
+  const sink = createRedactingSink<Record<string, unknown>>((record) => {
+    received.push(record);
+  });
+
+  const circular: Record<string, unknown> = { event: "e" };
+  circular.self = circular;
+  sink(circular);
+
+  const explosive: Record<string, unknown> = { event: "e", detail: r2Raw };
+  Object.defineProperty(explosive, "boom", {
+    enumerable: true,
+    get() {
+      throw new Error("the getter refuses to be read");
+    },
+  });
+  sink(explosive);
+
+  const hostile = new Proxy(
+    { event: "e" } as Record<string, unknown>,
+    {
+      ownKeys() {
+        throw new Error("the proxy refuses to enumerate");
+      },
+    },
+  );
+  sink(hostile);
+
+  sink({ event: "e", quantity: 1n } as unknown as Record<string, unknown>);
+
+  assert.equal(received.length, 4, "an unredactable record was dropped");
+  for (const record of received) {
+    assert.doesNotThrow(() => JSON.stringify(record), "the sink handed over something unserializable");
+  }
+  assert.equal(JSON.stringify(received).includes(r2Raw), false, "a raw value reached the listener");
+
+  // The cycle is redacted in place; everything this layer cannot handle becomes the fixed sentinel.
+  assert.equal(JSON.stringify(received[0]), '{"event":"e","self":"[REDACTED]"}');
+  for (const index of [1, 2, 3]) {
+    assert.equal(
+      `${JSON.stringify(received[index])}\n`,
+      REDACTION_FAILURE_LINE,
+      `record ${index} did not become the fixed sentinel`,
+    );
+  }
+});
+
+test("does not hand non-plain records back unredacted", () => {
+  const map = redactRecord(new Map<string, unknown>([["token", r2Ghp], ["safe", "keep"]]));
+  assert.equal(map instanceof Map, true, "a Map lost its type");
+  assert.equal(JSON.stringify([...(map as Map<string, unknown>)]).includes(r2Ghp), false, "a Map leaked");
+
+  const set = redactRecord(new Set<string>([`Bearer ${r2Ghp}`, "safe"]));
+  assert.equal(set instanceof Set, true, "a Set lost its type");
+  assert.equal([...(set as Set<string>)].join(" ").includes(r2Ghp), false, "a Set leaked");
+
+  class Session {
+    readonly id: string;
+    readonly detail: string;
+    constructor(id: string, detail: string) {
+      this.id = id;
+      this.detail = detail;
+    }
+  }
+
+  const session = new Session("s-1", `leaked ${r2Ghp}`);
+  const redactedSession = redactRecord(session);
+  assert.equal(redactedSession instanceof Session, true, "a class instance lost its prototype");
+  assert.equal(redactedSession.id, "s-1");
+  assert.equal(redactedSession.detail.includes(r2Ghp), false, "a class instance leaked");
+  assert.equal(redactRecord({ detail: "nothing to hide" }).detail, "nothing to hide");
+});
+
+test("handles an escaped JSON string around a credential body", () => {
+  const quote = String.fromCharCode(92) + '"';
+  const lines = [
+    `{"route":"Authorization: Bearer ${quote}${r2Raw}${quote}"}`,
+    `{"route":"x-api-key: ${quote}${r2Raw}${quote}"}`,
+  ];
+
+  for (const line of lines) {
+    const output = redact(line);
+    assertNoSecret(output, [r2Raw], "escaped quotes");
+    assert.ok(output.includes("route"), "the context was mangled");
+    assert.doesNotThrow(() => JSON.parse(output), "the emitted line is not JSON");
+    assert.equal(redact(output), output, "escaped quotes are not idempotent");
+  }
+});

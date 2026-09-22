@@ -150,12 +150,16 @@ export default function App(): JSX.Element {
           </button>
           <span className="action-meta">fixture 모드 · 유료 API 호출 없음</span>
         </div>
-        {notice === null ? null : (
-          <p className="action-notice" role="status">
-            <span aria-hidden="true">{TONE_ICON.wait}</span>
-            {notice}
-          </p>
-        )}
+        {/* 노드가 클릭 시점에 삽입되면 보조기술이 낭독을 놓치므로 리전을 항상 렌더하고
+            자식만 조건부로 채웁니다. 비어 있을 때는 CSS :empty가 시각적으로 숨깁니다. */}
+        <p className="action-notice" role="status" aria-live="polite">
+          {notice === null ? null : (
+            <>
+              <span aria-hidden="true">{TONE_ICON.wait}</span>
+              {notice}
+            </>
+          )}
+        </p>
       </header>
 
       <section aria-label="요약 지표" className="surface">

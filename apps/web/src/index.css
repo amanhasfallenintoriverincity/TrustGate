@@ -64,14 +64,17 @@ body {
   line-height: 1.62;
 }
 
-/* 긴 경로·해시·JSON 조각이 좁은 화면을 밀어내지 않도록 줄바꿈을 허용합니다. */
+/* 긴 경로·해시·JSON 조각이 좁은 화면을 밀어내지 않도록 줄바꿈을 허용합니다.
+   span(.action-meta, .status)과 button(.action)도 360px에서 밀려나지 않도록 포함합니다. */
 h1,
 h2,
 h3,
 p,
 li,
 pre,
-code {
+code,
+span,
+button {
   overflow-wrap: anywhere;
 }
 
@@ -107,6 +110,7 @@ ul {
   display: grid;
   gap: var(--space-sm);
   padding-block: var(--space-sm) var(--space-xs);
+  min-inline-size: 0;
 }
 
 .brand {
@@ -175,6 +179,11 @@ ul {
   font-size: 0.92rem;
 }
 
+/* 안내 문구가 없을 때는 리전을 남겨 두되(낭독 누락 방지) 시각적으로는 사라집니다. */
+.action-notice:empty {
+  display: none;
+}
+
 /* 카드 표면: 유리 효과는 여기서만, 그리고 약하게. */
 .surface,
 .card {
@@ -212,8 +221,7 @@ ul {
 }
 
 /* 요약 지표 */
-.metric-grid,
-.evidence-grid {
+.metric-grid {
   display: grid;
   gap: var(--space-sm);
   grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
@@ -326,6 +334,7 @@ ul {
   grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
   padding-block: var(--space-sm) 0;
   border-block-start: 1px solid var(--border);
+  min-inline-size: 0;
 }
 
 .footer-block {

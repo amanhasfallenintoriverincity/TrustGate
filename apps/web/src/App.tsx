@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { JSX } from "react";
 
 import {
@@ -358,20 +358,32 @@ const FAILURE_MESSAGE = "분석 실행이 실패했습니다";
 
 export default function App(): JSX.Element {
   const [run, setRun] = useState<RunState>({ phase: "idle" });
+  /**
+   * 재진입 가드입니다. `disabled`는 다음 렌더 뒤에야 붙으므로, 같은 태스크에서 두 번
+   * 눌리면 POST가 두 번 나가고 나중에 끝난 응답이 화면을 덮어씁니다. 상태 대신 ref로
+   * 임계 구역을 잠그고 `finally`에서 풀어, 실행이 어떤 식으로 끝나도 다시 실행할 수 있습니다.
+   */
+  const isRunningRef = useRef(false);
 
   const handleRun = (): void => {
+    if (isRunningRef.current) return; // 임계 구역 밖: 중복 요청은 여기서 끝냅니다.
+    isRunningRef.current = true;
     setRun({ phase: "running" });
-    void startFixtureRun().then(
-      (report) => {
-        setRun({ phase: "success", report });
-      },
-      (error: unknown) => {
-        setRun({
-          phase: "error",
-          message: error instanceof Error ? error.message : FAILURE_MESSAGE,
-        });
-      },
-    );
+    void startFixtureRun()
+      .then(
+        (report) => {
+          setRun({ phase: "success", report });
+        },
+        (error: unknown) => {
+          setRun({
+            phase: "error",
+            message: error instanceof Error ? error.message : FAILURE_MESSAGE,
+          });
+        },
+      )
+      .finally(() => {
+        isRunningRef.current = false;
+      });
   };
 
   const isSuccess = run.phase === "success";

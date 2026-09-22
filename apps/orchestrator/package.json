@@ -58,7 +58,8 @@
   "dependencies": {
     "@trustgate/contracts": "0.1.0",
     "@trustgate/llm-gateway": "0.1.0",
-    "execa": "10.0.1"
+    "execa": "10.0.1",
+    "fastify": "^5.12.5"
   },
   "devDependencies": {
     "@alibaba-group/open-code-review": "1.12.6",

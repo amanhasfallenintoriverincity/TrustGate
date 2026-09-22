@@ -35,3 +35,8 @@ Desktop.ini
 
 # Hermes agent workspace (plans, scratch)
 .hermes/
+
+# Playwright E2E run artifacts
+test-results/
+playwright-report/
+blob-report/

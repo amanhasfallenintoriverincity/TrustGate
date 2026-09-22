@@ -13,11 +13,20 @@ import { describe, expect, it } from "vitest";
 // 360px 레이아웃 뷰포트 · document.documentElement.scrollWidth):
 //   · 안내 요소에 96자 토큰: overflow-wrap:anywhere → 360px / break-word·normal → 740px.
 //   · 줄바꿈 그룹이 거는 <p>에 300자 토큰: anywhere → 360px / normal → 2509px.
-//   · 빈 리전에 display:none·visibility:hidden → AX role=status 1→0(노드 자체가 사라짐),
+//   · 빈 리전에 display:none·visibility:hidden·visibility:collapse → AX role=status 1→0
+//     (노드 자체가 사라짐. collapse도 hidden과 같이 ignored=true로 남지 않고 노드가 빠짐),
 //     1px + clip-path 조합은 1 유지.
 //   · 맨 고정 그리드 트랙(래핑 제거): .app-footer{320px 1fr} → 354 > 345(+9px),
 //     .metric-grid{320px 1fr} → 391 > 345(+46px), repeat(auto-fit,320px) → 카드 17px 초과.
+//   · 열 축을 적는 다른 형태: .metric-grid{grid:auto-flow/320px 320px} → scrollWidth
+//     360→669(computed gridTemplateColumns "320px 320px"),
+//     .metric-grid{grid-auto-flow:column;grid-auto-columns:320px} → 360→1325.
 // 정적 계약이 green이어도 실제 지오메트리·AX는 깨질 수 있고, 그 반대도 가능합니다.
+//
+// 정적으로 잡는 것(사정권): 열 축 트랙을 나열하는 네 가지 형태를 한 헬퍼
+// (columnTrackScan)로 훑습니다 — `grid-template-columns`, `grid-template`의 슬래시 뒤,
+// `grid` 단축의 슬래시 뒤(선행 `auto-flow`·`dense` 제거 후), `grid-auto-columns`.
+// 노드 제거 판정은 `display: none`과 `visibility: hidden`·`visibility: collapse`입니다.
 //
 // 정적으로 잡지 못하는 것(의도한 한계):
 //   · `all: revert`/`all: unset` 같은 캐스케이드 무력화의 일반형. 아래 all 검사는
@@ -25,10 +34,19 @@ import { describe, expect, it } from "vitest";
 //   · 정적으로 값이 정해지지 않는 트랙: `calc()`·`clamp()`·`var()`·`min()`/`max()`·
 //     `fit-content()`는 허용합니다(예: `min(320px, 1fr)`처럼 실제로는 줄어들지 않는 식도
 //     통과). 맨 절대 길이(`320px`·`20rem`·`50vw`)와 그런 트랙이 든 `repeat()`만 잡습니다.
+//   · 비정규 트랙 토큰: 지수 표기(`1e2px`)·퍼센트 트랙(`300%`)처럼 단위 문자로 끝나지
+//     않는 표기는 맨 절대 길이 토큰으로 인식되지 않습니다(관용적 CSS 표기가 아니며,
+//     `%`는 컨테이너 기준이라 애초에 고정 폭으로 다루지 않습니다).
+//   · 셀렉터 표기 변형: CSS 이스케이프(`.\61 ction-notice`), 속성 셀렉터
+//     (`[class~="action-notice"]`·`[role="status"]`)는 서브스트링 판정 밖입니다.
+//     둘 다 비관용적이라 사고로 생길 수 있는 형태가 아닙니다.
 //   · 런타임 지오메트리: 실제 주입 문자열 길이, 폰트 대체, 부모 폭, 이미지 크기.
 //   · 다른 파일·인라인 스타일·스크립트로 주입되는 스타일.
 //   · 시각적 숨김 레시피 목록(clip-path·position·1px·overflow) 밖의 숨김 기법:
 //     `transform`·`opacity`·`filter`·`height: 0` 등은 이 계약의 사정권이 아닙니다.
+//
+// `:empty` 규칙에 레시피 밖 선언이 하나라도 더 있으면 unmetSteps가 잡습니다. 이건 의도된
+// 엄격성입니다(빈 라이브 리전은 "남겨 두되 화면에서만 지운다"는 레시피 자체가 계약).
 //
 // 파서는 정규식이 아니라 postcss AST입니다. 정규식 파서는 CSS 중첩
 // (`.app-shell { … .action-notice:empty { display: none } }`), prefix 셀렉터
@@ -340,8 +358,12 @@ const nodeRemovers = (rule: RuleView): readonly string[] => {
   if (declaredValue(rule, "display") === "none") {
     offenders.push("display: none");
   }
-  if (declaredValue(rule, "visibility") === "hidden") {
-    offenders.push("visibility: hidden");
+
+  // `visibility: collapse`는 표 행이 아니어도 노드를 AX 트리에서 빼버립니다
+  // (CDP 실측 360px: 빈 리전의 role=status 노드가 ignored=true로 남지 않고 노드 자체가 사라짐).
+  const visibility = declaredValue(rule, "visibility");
+  if (visibility === "hidden" || visibility === "collapse") {
+    offenders.push(`visibility: ${visibility}`);
   }
   return offenders;
 };
@@ -595,6 +617,72 @@ const ownerOf = (declaration: Declaration): string => {
   return declaration.prop;
 };
 
+/** `grid` 단축의 열 쪽에 붙는 배치 키워드. 트랙이 아니라 배치 방식이라 스캔에서 뺍니다. */
+const GRID_PLACEMENT_KEYWORDS = new Set(["auto-flow", "dense"]);
+
+/**
+ * 선행 `auto-flow`·`dense` 키워드를 떼어냅니다(순서 무관·대소문자 무시).
+ * `grid: auto-flow / 320px 320px`의 `auto-flow`는 행/열 배치 방식이고,
+ * `grid: 100px / auto-flow 320px`의 `320px`은 grid-auto-columns라 열 축이 맞습니다.
+ * 그래서 키워드만 걷어내고 남은 토큰열을 그대로 스캔합니다.
+ */
+const stripLeadingPlacementKeywords = (value: string): string => {
+  const tokens = splitTopLevel(value, " ");
+  let index = 0;
+
+  while (
+    index < tokens.length &&
+    GRID_PLACEMENT_KEYWORDS.has((tokens[index] ?? "").toLowerCase())
+  ) {
+    index += 1;
+  }
+
+  return tokens.slice(index).join(" ");
+};
+
+type ColumnTrackScan = {
+  /** 이 선언이 열 축 트랙을 나열하는가. 스캔 대상이 하나도 없으면 green이 거짓일 수 있습니다. */
+  readonly scansColumns: boolean;
+  readonly fixed: readonly FixedTrack[];
+};
+
+/**
+ * 열(column) 축 트랙을 나열하는 선언 하나를 스캔합니다. 같은 트랙을 적는 네 가지 형태를
+ * 한곳에서 다룹니다 — 하나라도 빠지면 그 형태만 쓴 회귀가 조용히 통과합니다:
+ *   · `grid-template-columns: …` (직접 나열)
+ *   · `grid-template: 행 / 열` (슬래시 뒤가 열 축. 앞은 행 축이라 가로 오버플로와 무관)
+ *   · `grid: 행 / [auto-flow|dense] 열` (슬래시 뒤가 열 축 또는 grid-auto-columns)
+ *   · `grid-auto-columns: …`
+ * 슬래시 없는 `grid`/`grid-template`(`grid: none`)은 열 축을 나열한 게 아닙니다.
+ * `grid-template-rows`·`grid-auto-rows`처럼 행 축만 적는 선언은 그리드가 늘어나도
+ * 세로로만 늘어나므로 계약 밖입니다.
+ */
+const columnTrackScan = (declaration: Declaration): ColumnTrackScan => {
+  const scansNothing: ColumnTrackScan = { scansColumns: false, fixed: [] };
+  const key = propertyKey(declaration.prop);
+  const owner = `${ownerOf(declaration)} · ${declaration.prop}`;
+  const scan = (value: string): ColumnTrackScan => ({
+    scansColumns: true,
+    fixed: fixedTracksIn(value, owner),
+  });
+
+  if (key === "grid-template-columns" || key === "grid-auto-columns") {
+    return scan(declaration.value);
+  }
+
+  if (key !== "grid" && key !== "grid-template") {
+    return scansNothing;
+  }
+
+  const parts = splitTopLevel(declaration.value, "/");
+  if (parts.length < 2) {
+    return scansNothing;
+  }
+
+  const columns = parts.slice(1).join(" / ");
+  return scan(key === "grid" ? stripLeadingPlacementKeywords(columns) : columns);
+};
+
 describe("index.css 좁은 화면 계약", () => {
   it("CSS 소스를 실제로 읽어 postcss AST로 파싱했다", () => {
     // 파서가 빈 소스를 상대로 통과하는 가짜 GREEN을 막습니다.
@@ -693,33 +781,29 @@ describe("index.css 좁은 화면 계약", () => {
     // minmax()의 첫 인자만 보던 검사는 래핑을 통째로 뺀 형태를 놓쳤습니다:
     // `.app-footer { grid-template-columns: 320px 1fr }`는 계약 6/6 green인데
     // 실브라우저(360px)에서 354 > 345(+9px), `.metric-grid`는 391 > 345(+46px)로 밀렸습니다.
+    // 열 축을 적는 형태를 하나씩만 보던 검사도 마찬가지로 우회됐습니다:
+    // `.metric-grid { grid: auto-flow / 320px 320px }`는 계약 green인데 360px에서
+    // scrollWidth가 360→669로 늘었고(computed gridTemplateColumns "320px 320px"),
+    // `.metric-grid { grid-auto-flow: column; grid-auto-columns: 320px }`는 360→1325였습니다.
+    // 그래서 열 축 트랙을 나열하는 네 가지 형태를 columnTrackScan 한 곳에서 훑습니다.
     const fixed: FixedTrack[] = [];
     let scanned = 0;
 
     root.walkDecls((declaration) => {
-      const owner = `${ownerOf(declaration)} · ${declaration.prop}`;
-      const key = propertyKey(declaration.prop);
-
-      if (key === "grid-template-columns") {
-        fixed.push(...fixedTracksIn(declaration.value, owner));
+      const { scansColumns, fixed: found } = columnTrackScan(declaration);
+      if (scansColumns) {
         scanned += 1;
-        return;
       }
-
-      // `grid-template` 단축은 슬래시 뒤가 열 트랙입니다(앞은 행 트랙이라 가로 오버플로와 무관).
-      if (key === "grid-template") {
-        const parts = splitTopLevel(declaration.value, "/");
-        if (parts.length > 1) {
-          fixed.push(...fixedTracksIn(parts.slice(1).join(" / "), owner));
-          scanned += 1;
-        }
-      }
+      fixed.push(...found);
     });
 
-    expect(scanned, "grid-template-columns 선언을 찾지 못했습니다").toBeGreaterThan(0);
+    expect(
+      scanned,
+      "열 축 트랙을 나열하는 선언(grid-template-columns·grid-template·grid·grid-auto-columns)을 찾지 못했습니다",
+    ).toBeGreaterThan(0);
     expect(
       fixed.map((entry) => `${entry.owner}: ${entry.track}`),
-      "맨 고정 트랙은 좁은 화면에서 줄어들지 않아 가로 오버플로를 만듭니다(minmax(min(…,100%),1fr) 같은 래핑을 쓰세요)",
+      "맨 고정 트랙은 좁은 화면에서 줄어들지 않아 가로 오버플로를 만듭니다(grid-template-columns·grid-template·grid 단축·grid-auto-columns 모두 minmax(min(…,100%),1fr) 같은 래핑을 쓰세요)",
     ).toEqual([]);
   });
 
@@ -769,7 +853,8 @@ describe("index.css 빈 라이브 리전 처리", () => {
     expect(baseRules.length, "화면용 기본 .action-notice 규칙을 찾지 못했습니다").toBeGreaterThan(0);
 
     // (1) .action-notice를 겨냥하는 모든 규칙에서 노드 제거 금지(인쇄 매체 예외).
-    // display: none·visibility: hidden은 노드를 접근성 트리에서 통째로 빼버립니다.
+    // display: none·visibility: hidden·visibility: collapse는 노드를 접근성 트리에서
+    // 통째로 빼버립니다.
     for (const rule of screenRules) {
       expect(
         nodeRemovers(rule),
@@ -822,6 +907,16 @@ describe("검사기 자기 검증 — 합성 CSS fixture", () => {
   const resolvedFor = (source: string): readonly string[] => resolvedSelectorsOf(lastRuleOf(source));
   const viewFor = (source: string): RuleView => toRuleView(lastRuleOf(source));
   const declsFor = (source: string): ReadonlyMap<string, DeclaredValue> => viewFor(source).decls;
+
+  /** fixture의 모든 선언(문서 순서). 열 축 트랙 스캔 검사용. */
+  const declsOf = (source: string): readonly Declaration[] => {
+    const fixtureRoot = parse(source);
+    const found: Declaration[] = [];
+    fixtureRoot.walkDecls((declaration) => {
+      found.push(declaration);
+    });
+    return found;
+  };
 
   describe("중첩 셀렉터 해석(&)", () => {
     it("중첩이 아닌 규칙은 prefix 텍스트를 그대로 남긴다", () => {
@@ -982,6 +1077,79 @@ describe("검사기 자기 검증 — 합성 CSS fixture", () => {
       expect(
         tracks("fit-content(320px) calc(100% - 2rem) clamp(1px, 2vw, 3px) var(--tracks, 1fr)"),
       ).toEqual([]);
+    });
+  });
+
+  describe("열 축 트랙 스캔(grid·grid-auto-columns)", () => {
+    const scansOf = (source: string): readonly ColumnTrackScan[] =>
+      declsOf(source).map(columnTrackScan);
+    const tracksIn = (source: string): readonly string[] =>
+      scansOf(source).flatMap((scan) => scan.fixed.map((entry) => entry.track));
+    const scanCount = (source: string): number =>
+      scansOf(source).filter((scan) => scan.scansColumns).length;
+
+    it("`grid` 단축은 슬래시 뒤를 열 축으로 보고 선행 auto-flow·dense를 뗀다", () => {
+      expect(tracksIn(".x { grid: auto-flow / 320px 320px }")).toEqual(["320px", "320px"]);
+      expect(tracksIn(".x { grid: auto-flow dense 100px / 320px 1fr }")).toEqual(["320px"]);
+      // 키워드 순서·대소문자는 무관합니다.
+      expect(tracksIn(".x { grid: DENSE AUTO-FLOW / 20rem }")).toEqual(["20rem"]);
+      // 행 쪽 고정 트랙은 세로로만 늘어납니다(계약 밖).
+      expect(tracksIn(".x { grid: 100px / minmax(min(210px, 100%), 1fr) }")).toEqual([]);
+      // 열 쪽 auto-flow 뒤의 `320px`은 grid-auto-columns라 열 축이 맞습니다.
+      expect(tracksIn(".x { grid: 100px / auto-flow 320px }")).toEqual(["320px"]);
+      // 열이 auto-flow(자동 배치)뿐이면 고정 트랙이 아닙니다.
+      expect(tracksIn(".x { grid: 100px / auto-flow }")).toEqual([]);
+    });
+
+    it("`grid`·`grid-template`에 슬래시가 없으면 열 축을 나열한 게 아니다", () => {
+      expect(scanCount(".x { grid: none }")).toBe(0);
+      expect(tracksIn(".x { grid: none }")).toEqual([]);
+      expect(scanCount(".x { grid-template: 320px }")).toBe(0);
+    });
+
+    it("`grid-auto-columns`는 값 전체를 열 트랙열로 스캔한다", () => {
+      expect(tracksIn(".x { grid-auto-flow: column; grid-auto-columns: 320px }")).toEqual([
+        "320px",
+      ]);
+      expect(tracksIn(".x { grid-auto-columns: 320px 1fr }")).toEqual(["320px"]);
+      expect(tracksIn(".x { grid-auto-columns: minmax(min(210px, 100%), 1fr) }")).toEqual([]);
+      expect(tracksIn(".x { grid-auto-columns: 1fr }")).toEqual([]);
+      // 열 축을 나열한 선언으로는 세어야 합니다(스캔 대상 0개 = 거짓 green 방지).
+      expect(scanCount(".x { grid-auto-columns: 1fr }")).toBe(1);
+    });
+
+    it("행 축·배치 속성은 열 축 스캔 대상이 아니다", () => {
+      expect(scanCount(".x { grid-template-rows: 320px }")).toBe(0);
+      expect(scanCount(".x { grid-auto-rows: 320px }")).toBe(0);
+      expect(scanCount(".x { grid-auto-flow: column }")).toBe(0);
+      expect(scanCount(".x { grid-column: 1 / -1 }")).toBe(0);
+      // `grid-column: 1 / -1`의 슬래시를 열 트랙으로 오해하면 안 됩니다.
+      expect(tracksIn(".x { grid-column: 1 / -1 }")).toEqual([]);
+    });
+
+    it("`grid-template` 단축은 슬래시 뒤만 열 축으로 본다", () => {
+      expect(tracksIn(".x { grid-template: 320px / minmax(min(210px, 100%), 1fr) }")).toEqual([]);
+      expect(tracksIn(".x { grid-template: auto / 320px 1fr }")).toEqual(["320px"]);
+    });
+  });
+
+  describe("노드 제거 판정", () => {
+    it("visibility: hidden·collapse를 노드 제거로 본다", () => {
+      expect(nodeRemovers(viewFor(".x { visibility: collapse }"))).toEqual([
+        "visibility: collapse",
+      ]);
+      expect(nodeRemovers(viewFor(".x { visibility: HIDDEN }"))).toEqual(["visibility: hidden"]);
+      expect(nodeRemovers(viewFor(".x { display: none }"))).toEqual(["display: none"]);
+      expect(nodeRemovers(viewFor(".x { display: none; visibility: collapse }"))).toEqual([
+        "display: none",
+        "visibility: collapse",
+      ]);
+    });
+
+    it("visibility: visible·inherit는 노드 제거가 아니다", () => {
+      expect(nodeRemovers(viewFor(".x { visibility: visible }"))).toEqual([]);
+      expect(nodeRemovers(viewFor(".x { visibility: inherit }"))).toEqual([]);
+      expect(nodeRemovers(viewFor(".x { display: flex }"))).toEqual([]);
     });
   });
 });

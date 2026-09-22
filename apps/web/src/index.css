@@ -67,8 +67,9 @@ body {
 /* 긴 경로·해시·JSON 조각이 좁은 화면을 밀어내지 않도록 줄바꿈을 허용합니다.
    span·button은 클래스 스코프가 아니라 전역 span/button 리터럴로 적용합니다
    (`.action-meta`·`.status`·`.action`만 겨냥한 축소 금지 — 같은 토큰이 다른 요소로 들어와도
-   밀려나지 않아야 합니다). 값은 anywhere로 고정합니다: break-word로 되돌리면 360px에서
-   문서 폭이 다시 2624px까지 늘어납니다. */
+   밀려나지 않아야 합니다). 값은 anywhere로 고정합니다: break-word는 min-content 크기를
+   줄이지 않아 그리드/플렉스 트랙이 단어 폭까지 벌어집니다. CDP 실측(360px 고정 레이아웃
+   뷰포트, 안내 요소에 96자 토큰 주입): anywhere 문서 폭 360px → break-word 740px. */
 h1,
 h2,
 h3,
@@ -184,8 +185,9 @@ ul {
 
 /* 안내 문구가 없을 때는 리전을 남겨 두되(낭독 누락 방지) 화면에서만 지웁니다.
    display: none·visibility: hidden은 노드를 접근성 트리에서 통째로 빼버려
-   빈 상태에서 role=status가 사라지므로(CDP 실측: ignored, reason=notRendered)
-   1px + clip-path 시각적 숨김으로 렌더 상태를 유지합니다. */
+   빈 상태에서 role=status가 AX 트리에서 사라지므로(CDP 실측 360px: 두 값 모두
+   role=status 노드가 1→0으로 사라짐 — ignored로 남지 않고 노드 자체가 없음.
+   1px + clip-path 조합은 1 유지) 1px + clip-path 시각적 숨김으로 렌더 상태를 유지합니다. */
 .action-notice:empty {
   position: absolute;
   inline-size: 1px;

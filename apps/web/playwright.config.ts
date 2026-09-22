@@ -9,9 +9,12 @@ import { defineConfig } from "@playwright/test";
  * - 두 서버는 로컬·CI 구분 없이 **항상 Playwright가 기동하고 종료합니다**(`reuseExistingServer: false`).
  *   그래서 점유된 포트를 만나면 "이미 사용 중"으로 즉시 실패하고, 다른 코드 트리나 다른 설정으로
  *   떠 있는 서버를 조용히 검증하는 일이 없습니다. 정상 실행이 끝나면 포트도 함께 비워집니다.
- * - web 서버의 `TRUSTGATE_DEV_ORIGIN`은 여기서 8787로 고정합니다. Playwright는 webServer `env`를
- *   `{...process.env, ...env}`로 병합하므로, 이 값을 명시하지 않으면 ambient 값이 vite로 새어
- *   들어가 `/api`가 다른 오케스트레이터를 향하고 게이트가 다른 서버를 검증하게 됩니다.
+ * - 두 서버가 쓸 ambient 값을 여기서 고정합니다. Playwright는 webServer `env`를
+ *   `{...process.env, ...env}`로 병합하므로, 명시하지 않은 값은 ambient 환경에서 그대로 새어
+ *   들어갑니다. 그래서 web의 `TRUSTGATE_DEV_ORIGIN`은 8787로, 오케스트레이터의 `TRUSTGATE_HOST`는
+ *   127.0.0.1로 적습니다. 후자가 없으면 ambient `TRUSTGATE_HOST`가 살아 있을 때 오케스트레이터가
+ *   다른 주소에 바인드하고(예: `127.0.0.2:8787`), Playwright는 여기 적힌 `url`(`127.0.0.1:8787`)만
+ *   확인하므로 60초를 기다린 끝에 실패합니다 — 게이트가 검증하는 주소와 실제 서버 주소가 갈라집니다.
  */
 export default defineConfig({
   testDir: "./e2e",
@@ -31,6 +34,9 @@ export default defineConfig({
       url: "http://127.0.0.1:8787/health",
       env: {
         TRUSTGATE_MODE: "fixture",
+        // ambient `TRUSTGATE_HOST`가 살아 있으면 오케스트레이터가 아래 `url`과 다른 주소에
+        // 바인드합니다. 위 주석의 DEV_ORIGIN과 같은 이유로 여기서 127.0.0.1로 고정합니다.
+        TRUSTGATE_HOST: "127.0.0.1",
         TRUSTGATE_PORT: "8787",
       },
       // 점유된 포트(개발용 오케스트레이터 등)는 재사용하지 않고 즉시 실패합니다.

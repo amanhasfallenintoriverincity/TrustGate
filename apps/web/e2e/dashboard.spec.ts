@@ -30,9 +30,12 @@ const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\
 /**
  * 상태 문구·배지의 정확 일치 패턴입니다. 상태 요소는 장식 아이콘(`TONE_ICON`, `aria-hidden`)과
  * 문구를 한 요소에 담으므로(`✓ 실제 실행 결과`) 문구만으로는 완전 일치가 성립하지 않습니다.
- * 아이콘 자리(비공백 0~2자)만 허용하고 문구는 끝까지 정확히 요구합니다.
+ * 그래서 아이콘 자리는 화면이 실제로 쓰는 톤 글리프(`App.tsx`의 `TONE_ICON`: ✓ ◌ !)만 허용하고
+ * 문구는 끝까지 정확히 요구합니다. 자리를 `\S{0,2}`로 열어두면 다른 글리프(`✗`)나 임의의 두 글자
+ * (`접두 회귀 통과`)까지 통과해, 아이콘이 바뀐 화면을 이 스펙이 조용히 승인합니다(리뷰 LOW-2 실측).
  */
-const statusText = (label: string): RegExp => new RegExp(`^\\S{0,2}\\s*${escapeRegExp(label)}$`);
+const statusText = (label: string): RegExp =>
+  new RegExp(`^[\\u2713\\u25CC!]{0,2}\\s*${escapeRegExp(label)}$`);
 
 /**
  * 요약 지표 배지 = `.section-head`의 직계 span입니다. 리전 전체에서 문구를 찾으면 안내 문장
@@ -89,6 +92,16 @@ test("fixture 분석이 실제 API 왕복으로 취약 재현과 회귀 통과�
     "회귀 차단",
   ]);
   await expect(metrics.locator(".metric-value")).toHaveText(["2", "2", "3", "3"]);
+  // 값과 라벨만 보면 실행 결과 지표를 샘플 상수로 고정한 화면도 통과합니다(리뷰 M15 실측:
+  // 값 2/2/3/3과 라벨 4종이 `SAMPLE_METRICS`와 동일). 출처 문구는 실행 결과에만 있는 값이라,
+  // 첫 항목이 샘플의 "OCR 수집"이 아니라 "fixture 실행 대상"인지까지 확인해야 지표가 방금 실행한
+  // 응답(reviewedFiles.length)에서 왔다는 증거가 됩니다.
+  await expect(metrics.locator(".metric-meta")).toHaveText([
+    "fixture 실행 대상",
+    "LLM 후보",
+    "수정 전 버전",
+    "수정 후 버전",
+  ]);
 
   // 2) 실행 증거: 카드 4장이 첫 테스트의 요청·수정 전·수정 후·판정으로 채워집니다.
   const evidence = page.getByRole("region", { name: "실행 증거" });

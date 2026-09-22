@@ -282,6 +282,24 @@ const reportStages = (report: RunResponse): readonly Stage[] => {
 
 const formatJson = (value: JsonValue): string => JSON.stringify(value) ?? "null";
 
+/** 깊은 값을 pretty-print하지 못했을 때 값 대신 남기는 고정 문구입니다(엔진 원문 비노출). */
+const UNSHOWABLE_VALUE = "표시할 수 없는 값입니다";
+
+/**
+ * 실행 결과에서 온 값은 신뢰 경계 밖 데이터라 깊이를 믿을 수 없습니다. pretty-print는 값의
+ * 깊이만큼 재귀해서 깊게 중첩된 값(엔진 실측: 10k 이상)에서 `RangeError: Maximum call stack
+ * size exceeded`를 던지고, 에러 바운더리가 없어 화면 전체가 지워집니다. 그래서 pretty-print는
+ * 이 한 곳에서만 하고, 실패하면 값이나 엔진 문구 대신 고정 문구로 낮춥니다(얕은 값은 그대로).
+ * 한 줄짜리 `formatJson`(compact)은 같은 깊이에서도 스택을 쓰지 않아 이 위험이 없습니다.
+ */
+const prettyJson = (value: JsonValue): string => {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return UNSHOWABLE_VALUE;
+  }
+};
+
 /** 실행 결과 한 건을 카드 본문 줄로 폅니다. 색만으로 판정을 전달하지 않습니다. */
 const executionLines = (result: ExecutionResult): readonly string[] => [
   `판정 ${result.verdict}`,
@@ -294,7 +312,7 @@ const executionLines = (result: ExecutionResult): readonly string[] => [
 const requestBody = (test: RunTest): string =>
   test.request.body === undefined
     ? `${test.request.method} ${test.request.path}`
-    : `${test.request.method} ${test.request.path}\n${JSON.stringify(test.request.body, null, 2)}`;
+    : `${test.request.method} ${test.request.path}\n${prettyJson(test.request.body)}`;
 
 /**
  * 실행 증거는 report의 첫 테스트에서 요청·수정 전·수정 후·판정 네 장으로 재구성합니다.

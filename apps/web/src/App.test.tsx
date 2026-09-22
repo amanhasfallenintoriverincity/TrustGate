@@ -6,6 +6,7 @@ import type {
   ExecutionEvidence,
   ExecutionResult,
   ExecutionVerdict,
+  JsonValue,
   RegressionVerdict,
   RunResponse,
   RunTest,
@@ -194,6 +195,57 @@ const buildSingleTestReport = (
     },
   ],
   regressionVerdict: regression,
+});
+
+/**
+ * 2026-09-22 리뷰 P8 재현: `request.body`가 깊게 중첩되면 `JSON.stringify(_, null, 2)`가
+ * `RangeError: Maximum call stack size exceeded`를 던지고(엔진 실측: pretty는 10k에서 throw,
+ * compact는 500k까지 안전), 에러 바운더리가 없어 화면이 통째로 지워졌습니다
+ * (document.body 길이 11, 브랜드 텍스트 소실). 가드는 body 값을 확인하지 않으므로 이 응답은
+ * 화면 계약상 유효하고, 렌더 경로가 값을 고정 문구로 낮춰 나머지 섹션을 지켜야 합니다.
+ */
+const deepJsonBody = (depth: number): JsonValue => {
+  let value: JsonValue = "leaf";
+  for (let index = 0; index < depth; index += 1) {
+    value = { nested: value };
+  }
+  return value;
+};
+
+const DEEP_BODY_DEPTH = 20_000;
+
+/** 깊은 body 한 건을 포함하되 지표는 2/2/3/3(검토 파일 2·가설 2·재현 확정 3·회귀 차단 3)입니다. */
+const buildDeepRequestBody = (): RunResponse => ({
+  ...buildReport(),
+  reviewedFiles: ["apps/demo-target/src/server.ts", "apps/demo-target/src/store.ts"],
+  hypotheses: [
+    {
+      id: "price-authority",
+      title: "Server must own item prices instead of trusting the client",
+      category: "price-tampering",
+      severity: "high",
+      tests: [
+        {
+          ...runTest("negative-price", "price-authority", 200),
+          request: {
+            method: "POST",
+            path: "/api/purchase",
+            body: deepJsonBody(DEEP_BODY_DEPTH),
+          },
+        },
+        runTest("oversized-quantity", "price-authority", 201),
+      ],
+      regressionVerdict: "FIXED",
+    },
+    {
+      id: "ownership-check",
+      title: "Purchase must reject items owned by another actor",
+      category: "ownership-bypass",
+      severity: "critical",
+      tests: [runTest("foreign-item", "ownership-check", 200)],
+      regressionVerdict: "FIXED",
+    },
+  ],
 });
 
 type Deferred<Value> = {
@@ -399,6 +451,39 @@ describe("실행 재진입 가드", () => {
       expect(liveRegion()).toHaveTextContent("분석 완료");
     });
   });
+
+  it("실패한 뒤에도 버튼이 풀리고 두 번째 클릭이 새 POST를 보낸다", async () => {
+    const first = deferred<RunResponse>();
+    const second = deferred<RunResponse>();
+    startRun.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    render(<App />);
+
+    const button = clickRun();
+    await act(async () => {
+      first.reject(new Error("분석 실행이 실패했습니다"));
+    });
+    await waitFor(() => {
+      expect(liveRegion()).toHaveTextContent("분석 실행이 실패했습니다");
+    });
+    // 실패 경로도 실행 잠금을 풀어야 합니다(해제가 finally 밖으로 새면 여기서 잠깁니다).
+    expect(button).toBeEnabled();
+
+    fireEvent.click(button);
+
+    expect(startRun).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(button).toBeDisabled();
+      expect(liveRegion()).toHaveTextContent("fixture 분석을 실행하는 중입니다");
+    });
+
+    await act(async () => {
+      second.resolve(buildReport());
+    });
+    await waitFor(() => {
+      expect(liveRegion()).toHaveTextContent("분석 완료");
+    });
+    expectNoDialog();
+  });
 });
 
 describe("깨진 2xx 응답 경계", () => {
@@ -430,6 +515,47 @@ describe("깨진 2xx 응답 경계", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("깊은 request.body 렌더 경계", () => {
+  it("20k 깊이 body도 흰 화면 없이 고정 문구로 낮추고 나머지 섹션을 지킨다", async () => {
+    await renderReport(buildDeepRequestBody());
+
+    // 1) 브랜드 문구와 페이지 내용이 살아 있습니다(리뷰 재현: 흰 화면에서 body 길이 11).
+    expect(screen.getByText("TrustGate")).toBeInTheDocument();
+    const page = document.body.textContent ?? "";
+    expect(page.length).toBeGreaterThan(200);
+    // 엔진 원문(RangeError/스택 문구)은 화면 계약상 노출 금지입니다.
+    expect(page).not.toMatch(/RangeError|Maximum call stack|stack size exceeded/);
+
+    // 2) 모든 섹션이 남고 지표는 report 값(2/2/3/3)입니다.
+    for (const name of ["요약 지표", "분석 흐름", "실행 증거", "관리 범위", "라이선스와 제3자 고지"]) {
+      expect(screen.getByRole("region", { name })).toBeInTheDocument();
+    }
+    expect(metricItem("검토 파일")).toHaveTextContent("2");
+    expect(metricItem("도출 가설")).toHaveTextContent("2");
+    expect(metricItem("재현 확정")).toHaveTextContent("3");
+    expect(metricItem("회귀 차단")).toHaveTextContent("3");
+    expect(screen.getByText("실제 실행 결과")).toBeInTheDocument();
+
+    // 3) 깊은 값은 pretty-print 대신 고정 문구로만, 나머지 실행 증거는 그대로입니다.
+    const request = evidenceCard("요청");
+    expect(request).toHaveTextContent("POST /api/purchase");
+    expect(request).toHaveTextContent("표시할 수 없는 값입니다");
+    expect(request).not.toHaveTextContent("nested");
+    expect(evidenceCard("수정 전 응답")).toHaveTextContent("판정 CONFIRMED");
+    expect(evidenceCard("판정")).toHaveTextContent("회귀 통과");
+    expectNoDialog();
+  });
+
+  it("얕은 body는 기존과 같은 pretty JSON으로 남는다", async () => {
+    await renderReport(buildReport());
+
+    const request = evidenceCard("요청");
+    expect(request).toHaveTextContent("POST /api/purchase");
+    expect(request).toHaveTextContent('"price": -100');
+    expect(request).not.toHaveTextContent("표시할 수 없는 값입니다");
   });
 });
 

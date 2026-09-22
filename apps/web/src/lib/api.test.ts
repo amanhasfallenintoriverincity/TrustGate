@@ -347,6 +347,32 @@ const jsonFetcher = (payload: unknown, status: number): Mock<FetchLike> =>
     }),
   );
 
+/** 이미 문자열인 바디를 그대로 보냅니다(`JSON.stringify`로 표현할 수 없는 값 전용). */
+const rawJsonFetcher = (body: string, status: number): Mock<FetchLike> =>
+  vi.fn<FetchLike>(async () =>
+    new Response(body, {
+      status,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    }),
+  );
+
+/** 캡처 안의 객체 하나를 제자리에서 망가뜨리기 위한 느슨한 뷰입니다. */
+const mutableRecord = (value: unknown): Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("캡처 payload에서 객체를 기대했습니다");
+  }
+  return value as Record<string, unknown>;
+};
+
+const firstVulnerableResult = (payload: LivePayload): Record<string, unknown> =>
+  mutableRecord(firstTest(payload).vulnerableResult);
+
+const firstPatchedResult = (payload: LivePayload): Record<string, unknown> =>
+  mutableRecord(firstTest(payload).patchedResult);
+
+const firstDurations = (payload: LivePayload): Record<string, unknown> =>
+  mutableRecord(payload.durations);
+
 describe("startFixtureRun 요청 모양", () => {
   it("POST /api/runs로 fixture 소스를 보내고 201 응답을 파싱한다", async () => {
     const fetcher = jsonFetcher(FIXTURE_PAYLOAD, 201);
@@ -513,10 +539,37 @@ describe("startFixtureRun 렌더 경계 가드", () => {
    * 캡처 원문에서 한 필드씩만 망가뜨린 표입니다. `undefined`는 JSON.stringify가 키 자체를
    * 지우므로 "필드 없음"을, 나머지는 "타입 불일치"를 검사합니다.
    */
-  const DAMAGED_PAYLOADS: readonly {
+  type DamagedPayload = {
     readonly name: string;
     readonly damage: (payload: LivePayload) => void;
-  }[] = [
+    /**
+     * 직렬화된 원문을 직접 고칩니다. `JSON.stringify`는 `Infinity`를 `null`로 쓰기 때문에
+     * 유한하지 않은 수는 객체 단계에서 만들 수 없고, `1e999` 같은 리터럴을 원문에 적어
+     * `JSON.parse`가 `Infinity`를 만들게 해야 합니다.
+     */
+    readonly rewrite?: (serialized: string) => string;
+  };
+
+  /** 캡처 원문에서 리터럴 하나를 바꿉니다(못 찾으면 캡처가 달라진 것이므로 테스트를 세웁니다). */
+  const replaceOnce = (text: string, from: string, to: string): string => {
+    if (!text.includes(from)) throw new Error(`캡처 원문에서 ${from}를 찾지 못했습니다`);
+    return text.replace(from, to);
+  };
+
+  /**
+   * 유한하지 않은 수를 원문에 심고, 정말 `Infinity`로 파싱되는지 먼저 확인합니다. 확인 없이
+   * 쓰면 `isFiniteNumber`가 아니라 다른 검사가 막아도 테스트가 통과해 핀이 무의미해집니다.
+   */
+  const infNumberRewrite =
+    (key: string, value: number) =>
+    (serialized: string): string => {
+      const damaged = replaceOnce(serialized, `"${key}":${value}`, `"${key}":1e999`);
+      const parsed = JSON.parse(damaged) as { durations: Record<string, unknown> };
+      expect(parsed.durations[key]).toBe(Number.POSITIVE_INFINITY);
+      return damaged;
+    };
+
+  const DAMAGED_PAYLOADS: readonly DamagedPayload[] = [
     { name: "runId 없음", damage: (payload) => (payload.runId = undefined) },
     { name: "provider가 숫자", damage: (payload) => (payload.provider = 7) },
     { name: "model 없음", damage: (payload) => (payload.model = undefined) },
@@ -603,14 +656,76 @@ describe("startFixtureRun 렌더 경계 가드", () => {
       name: "durations.totalMs가 문자열",
       damage: (payload) => (payload.durations = { totalMs: "1840" }),
     },
+    // ── 2026-09-22 리뷰 2라운드: 가드 약화 변이 7종을 잡는 핀 ──────────────────────────
+    // 아래 항목은 "그 필드가 존재하는가"만 보는 가드(M2/M3/M12/M13/M14/M15/M19)에서 전부
+    // 통과해, 빈 라벨·무의미한 지표·거짓 통과로 이어졌습니다. 각 항목은 해당 검사를 지운
+    // 스크래치 변이에서 죽습니다(원본 리포지토리는 무변이).
+    {
+      name: "가설 regressionVerdict가 bogus 문자열(TAMPERED)",
+      damage: (payload) => (firstHypothesis(payload).regressionVerdict = "TAMPERED"),
+    },
+    {
+      name: "테스트 regressionVerdict가 bogus 문자열(TAMPERED)",
+      damage: (payload) => (firstTest(payload).regressionVerdict = "TAMPERED"),
+    },
+    {
+      name: "report regressionVerdict가 bogus 문자열(TAMPERED)",
+      damage: (payload) => (payload.regressionVerdict = "TAMPERED"),
+    },
+    {
+      name: "vulnerableResult.verdict가 bogus 문자열(TAMPERED)",
+      damage: (payload) => (firstVulnerableResult(payload).verdict = "TAMPERED"),
+    },
+    {
+      name: "patchedResult.verdict가 bogus 문자열(TAMPERED)",
+      damage: (payload) => (firstPatchedResult(payload).verdict = "TAMPERED"),
+    },
+    {
+      name: "vulnerableResult.executed가 문자열",
+      damage: (payload) => (firstVulnerableResult(payload).executed = "true"),
+    },
+    {
+      name: "patchedResult.executed가 문자열",
+      damage: (payload) => (firstPatchedResult(payload).executed = "yes"),
+    },
+    {
+      name: "evidence[0].kind가 숫자",
+      damage: (payload) =>
+        (firstVulnerableResult(payload).evidence = [{ kind: 7, expected: 400, actual: 200 }]),
+    },
+    {
+      name: "vulnerableResult.runId 없음",
+      damage: (payload) => (firstVulnerableResult(payload).runId = undefined),
+    },
+    {
+      name: "vulnerableResult.hypothesisId 없음",
+      damage: (payload) => (firstVulnerableResult(payload).hypothesisId = undefined),
+    },
+    {
+      name: "durations.ocrMs가 문자열",
+      damage: (payload) => (firstDurations(payload).ocrMs = "210"),
+    },
+    {
+      name: "durations.ocrMs가 1e999(JSON.parse → Infinity)",
+      damage: () => undefined,
+      rewrite: infNumberRewrite("ocrMs", 210),
+    },
+    {
+      name: "durations.totalMs가 1e999(JSON.parse → Infinity)",
+      damage: () => undefined,
+      rewrite: infNumberRewrite("totalMs", 1840),
+    },
   ];
 
-  it.each(DAMAGED_PAYLOADS)("$name → 형식 오류로 거부한다", async ({ damage }) => {
+  it.each(DAMAGED_PAYLOADS)("$name → 형식 오류로 거부한다", async ({ damage, rewrite }) => {
     const payload = livePayload();
     damage(payload);
 
-    await expect(startFixtureRun(jsonFetcher(payload, 201))).rejects.toThrow(
-      "응답 형식이 올바르지 않습니다",
-    );
+    const fetcher =
+      rewrite === undefined
+        ? jsonFetcher(payload, 201)
+        : rawJsonFetcher(rewrite(JSON.stringify(payload)), 201);
+
+    await expect(startFixtureRun(fetcher)).rejects.toThrow("응답 형식이 올바르지 않습니다");
   });
 });

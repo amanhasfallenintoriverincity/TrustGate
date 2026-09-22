@@ -8,8 +8,8 @@
  *   상태 코드별 고정 한국어 문구로 바꿉니다.
  * - 네트워크 실패: 전송 계층 예외(`TypeError: Failed to fetch`처럼 브라우저마다 다른 원문)도
  *   그대로 흘리지 않고 네트워크 고정 한국어 문구로 바꿉니다.
- * - 2xx 형식 오류: 응답 가드(`isRenderableRunResponse`)가 화면(`App.tsx`)이 실제로 읽는
- *   필드를 전부 확인하고, 하나라도 어긋나면 고정 문구로 알립니다. 렌더 중 `TypeError`로
+ * - 2xx 형식 오류: 응답 가드(`isRenderableRunResponse`)가 화면(`App.tsx`)이 읽는 필드와 계약이
+ *   요구하는 반향 필드를 확인하고, 하나라도 어긋나면 고정 문구로 알립니다. 렌더 중 `TypeError`로
  *   흰 화면이 되는 일이 없도록 하는 경계이고, 계약 전 필드 검증은 오케스트레이터 몫입니다.
  *
  * 타입은 orchestrator 소스의 `report.ts`/`contracts` 구조에서 웹이 실제로 읽는 필드만
@@ -79,21 +79,42 @@ export type RunDurations = {
   readonly patchedMs: number;
 };
 
-/** `report.ts`의 `RunReport` 서브셋. 필드 이름은 원본과 정확히 같습니다. */
-export type RunReport = {
+/**
+ * 렌더 경계 가드(`isRenderableRunResponse`)가 실제로 확인하는 필드만 담은 검증 서브셋입니다.
+ * 뷰(`App.tsx`)가 읽는 필드에 더해, 뷰가 읽지는 않지만 계약이 모양을 정하는 반향 필드까지
+ * 포함합니다(그 필드들은 `RunHypothesis`/`RunTest`/`ExecutionResult`/`RunDurations` 안에 있습니다).
+ */
+export type RenderableRunResponse = {
   readonly runId: string;
   readonly provider: string;
   readonly model: string;
   readonly reviewedFiles: readonly string[];
   readonly hypotheses: readonly RunHypothesis[];
-  readonly vulnerableResults: readonly ExecutionResult[];
-  readonly patchedResults: readonly ExecutionResult[];
   readonly regressionVerdict: RegressionVerdict;
   readonly durations: RunDurations;
 };
 
-/** `server.ts`의 `RunResponse` — 보고서에 실행 소스를 덧붙인 201 응답입니다. */
-export type RunResponse = RunReport & { readonly source: string };
+/**
+ * `report.ts`의 `RunReport` 서브셋(= 검증 서브셋 + 화면이 읽지 않는 집계 배열).
+ * 필드 이름은 원본과 정확히 같습니다.
+ */
+export type RunReport = RenderableRunResponse & {
+  readonly vulnerableResults: readonly ExecutionResult[];
+  readonly patchedResults: readonly ExecutionResult[];
+};
+
+/**
+ * `server.ts`의 `RunResponse` — 보고서에 실행 소스를 덧붙인 201 응답입니다.
+ *
+ * 가드가 확인하지 않는 필드는 선택으로 선언합니다: `source`와 집계 배열은 값이 없거나
+ * 어긋나도 렌더가 그대로 진행되므로(가드 통과 후 그대로 노출), 필수로 선언하면 타입이 실제
+ * 통과 경로보다 강한 보증을 하게 됩니다.
+ */
+export type RunResponse = RenderableRunResponse & {
+  readonly source?: string;
+  readonly vulnerableResults?: readonly ExecutionResult[];
+  readonly patchedResults?: readonly ExecutionResult[];
+};
 
 const RUN_ENDPOINT = "/api/runs";
 const FIXTURE_REQUEST_BODY = JSON.stringify({ source: "fixture" });
@@ -198,16 +219,27 @@ const isRunDurations = (value: unknown): boolean =>
   isFiniteNumber(value.patchedMs);
 
 /**
- * 렌더 경계 가드입니다. 2xx로 온 바디가 `App.tsx`가 실제로 읽는(dereference하는) 필드를
- * 전부 갖췄는지만 확인합니다. 여기서 통과시키면 렌더 중 `TypeError`가 날 수 없습니다:
- * `reviewedFiles.length`/`join`, `hypotheses.map`, `test.tests.map`, `durations.totalMs`,
- * `provider`/`model` 보간, 판정 라벨 표 인덱싱이 모두 보호됩니다.
+ * 렌더 경계 가드입니다. 2xx로 온 바디에서 화면(`App.tsx`)이 읽는 필드와, 계약이 모양을 정하는
+ * 반향 필드를 확인합니다. 여기서 통과시키면 렌더 중 `TypeError`가 날 수 없습니다.
  *
- * 화면이 읽지 않는 필드(집계 배열 `vulnerableResults`/`patchedResults` 등)는 확인하지
- * 않습니다. 전체 계약 검증은 오케스트레이터의 스키마 몫이고, 여기서 대신 하면 유효한
- * 응답을 막을 위험만 커집니다.
+ * 확인하는 것
+ * - 뷰가 dereference하는 필드: `runId`(상태 문구 보간), `provider`/`model`(단계 meta 보간),
+ *   `reviewedFiles`(`length`/`join`), `hypotheses[].id`/`title`, `hypotheses[].tests[]`,
+ *   `test.id`, `test.request.method`/`path`, `test.vulnerableResult`/`patchedResult`의
+ *   `verdict`/`executed`/`evidence`(`kind`/`expected`/`actual`), `test.regressionVerdict`와
+ *   `report.regressionVerdict`(판정 라벨·색 표 인덱싱), `durations.totalMs`.
+ * - 뷰가 읽지는 않지만 계약이 요구하는 반향 필드: `hypothesis.regressionVerdict`,
+ *   `hypothesis.category`/`severity`, `executionResult.runId`/`hypothesisId`,
+ *   `durations.ocrMs`/`planningMs`/`vulnerableMs`/`patchedMs`(숫자 슬롯은 `isFiniteNumber`로
+ *   유한한 수인지까지 확인합니다).
+ *
+ * 확인하지 않는 것(의도한 경계): `source`(전송 메타)와 집계 배열 `vulnerableResults`/
+ * `patchedResults`. 셋 다 화면이 읽지 않으므로 어떤 값이 와도 렌더는 그대로 진행되고, 여기서
+ * 대신 검증하면 유효한 응답을 막을 위험만 커집니다. `request.body`도 값 자체는 확인하지
+ * 않습니다(화면은 직렬화만 하고, 깊은 값은 `App.tsx`의 표시 경로가 고정 문구로 낮춥니다).
+ * 전체 계약 검증은 오케스트레이터의 스키마 몫입니다.
  */
-const isRenderableRunResponse = (value: unknown): boolean =>
+const isRenderableRunResponse = (value: unknown): value is RenderableRunResponse =>
   isRecord(value) &&
   isString(value.runId) &&
   isString(value.provider) &&
@@ -226,8 +258,9 @@ const isRenderableRunResponse = (value: unknown): boolean =>
  */
 const parseRunResponse = (value: unknown): RunResponse => {
   if (!isRenderableRunResponse(value)) throw new Error(INVALID_RESPONSE_MESSAGE);
-  // 가드가 화면이 읽는 필드만 확인하므로(집계 배열은 제외) 단언 한 번으로 좁힙니다.
-  return value as RunResponse;
+  // 가드는 검증 서브셋까지만 좁히므로, 확인하지 않는 선택 필드(`source`·집계 배열)는
+  // 통과한 값 그대로 남습니다. 여기서 타입 단언 없이 대입이 성립하는 이유입니다.
+  return value;
 };
 
 /**

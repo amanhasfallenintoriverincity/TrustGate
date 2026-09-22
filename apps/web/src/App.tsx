@@ -151,7 +151,8 @@ export default function App(): JSX.Element {
           <span className="action-meta">fixture 모드 · 유료 API 호출 없음</span>
         </div>
         {/* 노드가 클릭 시점에 삽입되면 보조기술이 낭독을 놓치므로 리전을 항상 렌더하고
-            자식만 조건부로 채웁니다. 비어 있을 때는 CSS :empty가 시각적으로 숨깁니다. */}
+            자식만 조건부로 채웁니다. 비어 있을 때는 CSS :empty가 1px 시각적 숨김으로
+            화면에서만 지우고, 접근성 트리에는 role=status로 남깁니다(display: none 금지). */}
         <p className="action-notice" role="status" aria-live="polite">
           {notice === null ? null : (
             <>

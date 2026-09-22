@@ -31,6 +31,10 @@
  *   false positive is the safe direction to err in, so the trade stands.
  * - The credential-path scan widens at most 512 characters on each side of a marker, so an
  *   unusually long unbroken run around a path loses only that window, never the whole line.
+ * - Credential-name prefixes (≤64 characters), api-key prefixes (≤8 `word_` segments), scheme
+ *   prefixes (≤64) and URL userinfo (≤255) are matched with a bounded width. Those caps keep the
+ *   match linear on an adversarial single line — the unbounded form was measured at 5.5 seconds on
+ *   a 64KB line — and an input past a cap loses only that one match, never the whole line.
  */
 
 /** Written in place of every credential-shaped match. */
@@ -106,14 +110,14 @@ const AUTHORIZATION_PATTERN = new RegExp(
 
 /** `x-api-key: <credential>`, `apiKey=<credential>`, `API_KEY=<credential>`. */
 const API_KEY_PATTERN = new RegExp(
-  `\\b((?:[A-Za-z0-9]+[_-])*api[-_]?key)(["']?${GAP}*(?:[:=]|%3A|%3D)${GAP}*)(?!\\[REDACTED\\])${VALUE}`,
+  `\\b((?:[A-Za-z0-9]+[_-]){0,8}api[-_]?key)(["']?${GAP}*(?:[:=]|%3A|%3D)${GAP}*)(?!\\[REDACTED\\])${VALUE}`,
   "gi",
 );
 
 /** `GITHUB_TOKEN=…`, `DB_PASSWORD=…`, `PASS`, `PWD`, `CREDS`: suffix matching, so any trailing
  *  fragment joins the name (`apiKey` and `userPassword` are covered the same way). */
 const SECRET_NAME =
-  "[A-Za-z0-9_-]*(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?ACCESS[_-]?KEY|TOKEN|SECRET|" +
+  "[A-Za-z0-9_-]{0,64}(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?ACCESS[_-]?KEY|TOKEN|SECRET|" +
   "PASSWORD|PASSWD|PASSPHRASE|PASS|PWD|CREDS|CREDENTIALS?|BEARER|COOKIE|PRIVATE[_-]?KEY|" +
   "SESSION[_-]?KEY|SIGNING[_-]?KEY)";
 const SECRET_ASSIGNMENT_PATTERN = new RegExp(

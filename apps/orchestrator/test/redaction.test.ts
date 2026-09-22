@@ -637,3 +637,63 @@ test("handles an escaped JSON string around a credential body", () => {
     assert.equal(redact(output), output, "escaped quotes are not idempotent");
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// Round 3 hardening (written RED first): the remaining credential-name prefixes are matched with a
+// bounded width — a secret name (≤64 characters) and an api-key prefix (≤8 `word_` segments) — so a
+// single adversarial line with dense word boundaries stays linear instead of quadratic. The
+// credential literals are assembled at runtime, as above.
+// ---------------------------------------------------------------------------------------------
+
+/** Joins credential fragments: keeps the literals out of the file and out of any log. */
+const r3Join = (...parts: readonly string[]): string => parts.join("");
+const r3Value = r3Join("S3", "cr3t", "-", "V4lue");
+const r3Token = r3Join("tkn", "-", "H".repeat(24));
+
+/** The adversarial single-line shapes from the round 3 brief: dense word boundaries turn every
+ *  unbounded credential-name prefix into a candidate start, which is quadratic on one line. */
+const r3Shapes: readonly (readonly [string, string])[] = [
+  ["a-", "a-".repeat(32768)],
+  ["-a", "-a".repeat(32768)],
+  ["sk-", "sk-".repeat(21845)],
+  ["-----BEGIN", "-----BEGIN".repeat(6553)],
+];
+
+for (const [name, line] of r3Shapes) {
+  test(`keeps the ${name} run linear: redact() stays under 200ms`, () => {
+    const started = process.hrtime.bigint();
+    redact(line);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+    assert.ok(elapsedMs < 200, `the ${name} shape took ${elapsedMs.toFixed(0)}ms`);
+  });
+}
+
+test("keeps masking credential names inside the bounded prefix width", () => {
+  const name64 = "n".repeat(64);
+  const cases: readonly (readonly [string, string])[] = [
+    [`${name64}PASSWORD=${r3Value}`, `${name64}PASSWORD=${REDACTED}`],
+    [`someLongPrefix_api_key=abcd1234`, `someLongPrefix_api_key=${REDACTED}`],
+    [`x-api-key: ${r3Token}`, `x-api-key: ${REDACTED}`],
+  ];
+
+  cases.forEach(([line, expected], index) => {
+    const output = redact(line);
+    assertNoSecret(output, [r3Value, r3Token, "abcd1234"], `bounded prefix ${index}`);
+    assert.equal(output, expected, `bounded prefix ${index} did not keep its shape`);
+    assert.equal(redact(output), output, `bounded prefix ${index} is not idempotent`);
+  });
+});
+
+test("pins the accepted width boundary: a name past the cap loses only its own match", () => {
+  const line = `${"x".repeat(80)}PASSWORD=${r3Value}`;
+
+  assert.equal(redact(line), line, "a name past the cap was matched anyway");
+});
+
+test("stays idempotent on the adversarial separator runs", () => {
+  for (const [name, line] of r3Shapes) {
+    const once = redact(line);
+    assert.equal(redact(once), once, `${name} is not idempotent`);
+  }
+});

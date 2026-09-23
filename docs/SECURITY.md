@@ -10,7 +10,7 @@ TrustGate는 LLM이 확정 판정을 내리지 않도록 실행과 보고의 책
 
 ## 격리 실행 및 로그
 
-`SANDBOX_CONTAINERS_CONF`(`sandbox-policy.ts`)는 `env_host=false`, `mounts=[]`, `volumes=[]`, `http_proxy=false`, `read_only=true` 등의 Podman 기본값을 고정합니다. 실행기는 각 호출마다 제한된 권한의 임시 `containers.conf`를 생성해 `CONTAINERS_CONF`로 지정하고, 종료 시 해당 구성과 정확히 일치하는 컨테이너를 정리합니다(`sandbox-runner.ts`). 이 설정은 호스트의 일반적인 Podman 환경값이 검사 대상에 흘러드는 것을 줄이며, `--network none`은 컨테이너의 외부 네트워크를 차단합니다. 반면 이미지 빌드는 기반 이미지 및 의존성 입수에 네트워크가 필요할 수 있으므로 실행 단계의 오프라인 정책과 혼동하지 마십시오.
+`SANDBOX_CONTAINERS_CONF`(`sandbox-policy.ts`)는 `env_host=false`, `mounts=[]`, `volumes=[]`, `http_proxy=false`, `read_only=true` 등의 Podman 기본값을 고정합니다. 실행기는 각 호출마다 제한된 권한의 임시 `containers.conf`를 생성해 `CONTAINERS_CONF`로 지정하고, 종료 시 정책에서 만든 고유 이름으로 컨테이너를 제거하고 `container exists`로 이름이 남아 있는지 확인합니다(`sandbox-runner.ts`). 컨테이너 구성을 비교하지는 않습니다. 이 설정은 호스트의 일반적인 Podman 환경값이 검사 대상에 흘러드는 것을 줄이며, `--network none`은 컨테이너의 외부 네트워크를 차단합니다. 반면 이미지 빌드는 기반 이미지 및 의존성 입수에 네트워크가 필요할 수 있으므로 실행 단계의 오프라인 정책과 혼동하지 마십시오.
 
 `redaction.ts`는 출력 직전에 로그의 자격 증명 패턴을 지우고 처리 실패 시 원문 대신 고정 실패 기록을 남깁니다. `server.ts`는 Fastify 기본 로거를 끄고 비민감 메타데이터만 로그에 전달하며, 오류 응답도 고정 문구로 제한합니다. 회귀 테스트(`redaction.test.ts`, `sandbox-policy.test.ts`, `sandbox-runner.test.ts`)는 누출 및 정책 경로를 검사합니다. 이것은 모든 가능한 비밀 문자열에 대한 절대적 보장을 뜻하지 않으므로 민감 데이터를 입력·예시·로그에 넣지 마십시오.
 

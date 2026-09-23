@@ -35,7 +35,7 @@ curl -i -H 'Content-Type: application/json' -d '{"source":"fixture"}' http://127
 
 ## 별도 경로: rootless Podman 실실행 검증
 
-이 경로는 fixture 화면과 다릅니다. rootless Podman이 동작하는 환경에서 동일한 테스트 명세를 취약/수정 이미지에 실행해 기록된 판정과 대조합니다. 저장소 루트에서 순서대로 실행하며 개발 서버가 8787/5173 포트를 점유 중이라면 먼저 종료합니다.
+이 경로는 fixture 화면과 다릅니다. rootless Podman이 동작하는 환경에서 동일한 이미지에 `TARGET_MODE=vulnerable/patched`를 각각 지정해 같은 테스트 명세를 실행하고 기록된 판정과 대조합니다. 저장소 루트에서 순서대로 실행하며 개발 서버가 8787/5173 포트를 점유 중이라면 먼저 종료합니다.
 
 ```bash
 podman build -f apps/demo-target/Containerfile.sandbox -t localhost/trustgate-target:sandbox .

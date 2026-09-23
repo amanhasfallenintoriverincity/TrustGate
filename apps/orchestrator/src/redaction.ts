@@ -31,10 +31,13 @@
  *   false positive is the safe direction to err in, so the trade stands.
  * - The credential-path scan widens at most 512 characters on each side of a marker, so an
  *   unusually long unbroken run around a path loses only that window, never the whole line.
- * - Credential-name prefixes (≤64 characters), api-key prefixes (≤8 `word_` segments), scheme
- *   prefixes (≤64) and URL userinfo (≤255) are matched with a bounded width. Those caps keep the
- *   match linear on an adversarial single line — the unbounded form was measured at 5.5 seconds on
- *   a 64KB line — and an input past a cap loses only that one match, never the whole line.
+ * - Credential-name prefixes (≤64 characters), api-key prefixes (≤8 word/hyphen/underscore
+ *   segments), scheme prefixes (≤64 characters) and URL userinfo components (≤255 characters
+ *   each) bound individual matcher attempts. Without these caps, dense word boundaries caused
+ *   quadratic work (5.5 seconds on a 64KB line). A cap does not guarantee whole-key non-redaction:
+ *   a later word boundary after a hyphen can start another match, and other rules may mask the key.
+ *   Over-redaction is safer than leaking; an over-cap input does not by itself drop the whole line
+ *   or prevent a separate field on that line from being redacted.
  */
 
 /** Written in place of every credential-shaped match. */

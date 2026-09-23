@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
-import test from "node:test";
+import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -639,61 +639,117 @@ test("handles an escaped JSON string around a credential body", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// Round 3 hardening (written RED first): the remaining credential-name prefixes are matched with a
-// bounded width — a secret name (≤64 characters) and an api-key prefix (≤8 `word_` segments) — so a
-// single adversarial line with dense word boundaries stays linear instead of quadratic. The
-// credential literals are assembled at runtime, as above.
+// Round 3 hardening: the original performance tests were written RED first. Prefix caps bound
+// individual matcher attempts, not whole-key behavior: later boundaries and overlapping rules can
+// still mask. New acceptance tests pin those existing boundaries (they passed on first run).
+// Credential-shaped dummies are assembled at runtime; equality checks do not echo full values.
+// assertNoSecret reports only a short prefix and length on failure.
 // ---------------------------------------------------------------------------------------------
 
-/** Joins credential fragments: keeps the literals out of the file and out of any log. */
-const r3Join = (...parts: readonly string[]): string => parts.join("");
-const r3Value = r3Join("S3", "cr3t", "-", "V4lue");
-const r3Token = r3Join("tkn", "-", "H".repeat(24));
+describe("Round 3 bounded matcher attempts and overlap", () => {
+  /** Joins credential fragments: keeps credential-shaped literals out of the file. */
+  const r3Join = (...parts: readonly string[]): string => parts.join("");
+  const r3Value = r3Join("S3", "cr3t", "-", "V4lue");
+  const r3Token = r3Join("tkn", "-", "H".repeat(24));
 
-/** The adversarial single-line shapes from the round 3 brief: dense word boundaries turn every
- *  unbounded credential-name prefix into a candidate start, which is quadratic on one line. */
-const r3Shapes: readonly (readonly [string, string])[] = [
-  ["a-", "a-".repeat(32768)],
-  ["-a", "-a".repeat(32768)],
-  ["sk-", "sk-".repeat(21845)],
-  ["-----BEGIN", "-----BEGIN".repeat(6553)],
-];
-
-for (const [name, line] of r3Shapes) {
-  test(`keeps the ${name} run linear: redact() stays under 200ms`, () => {
-    const started = process.hrtime.bigint();
-    redact(line);
-    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-
-    assert.ok(elapsedMs < 200, `the ${name} shape took ${elapsedMs.toFixed(0)}ms`);
-  });
-}
-
-test("keeps masking credential names inside the bounded prefix width", () => {
-  const name64 = "n".repeat(64);
-  const cases: readonly (readonly [string, string])[] = [
-    [`${name64}PASSWORD=${r3Value}`, `${name64}PASSWORD=${REDACTED}`],
-    [`someLongPrefix_api_key=abcd1234`, `someLongPrefix_api_key=${REDACTED}`],
-    [`x-api-key: ${r3Token}`, `x-api-key: ${REDACTED}`],
+  /** Adversarial single-line shapes: unbounded prefixes would retry at dense word boundaries. */
+  const r3Shapes: readonly (readonly [string, string])[] = [
+    ["a-", "a-".repeat(32768)],
+    ["-a", "-a".repeat(32768)],
+    ["sk-", "sk-".repeat(21845)],
+    ["-----BEGIN", "-----BEGIN".repeat(6553)],
   ];
 
-  cases.forEach(([line, expected], index) => {
-    const output = redact(line);
-    assertNoSecret(output, [r3Value, r3Token, "abcd1234"], `bounded prefix ${index}`);
-    assert.equal(output, expected, `bounded prefix ${index} did not keep its shape`);
-    assert.equal(redact(output), output, `bounded prefix ${index} is not idempotent`);
-  });
-});
-
-test("pins the accepted width boundary: a name past the cap loses only its own match", () => {
-  const line = `${"x".repeat(80)}PASSWORD=${r3Value}`;
-
-  assert.equal(redact(line), line, "a name past the cap was matched anyway");
-});
-
-test("stays idempotent on the adversarial separator runs", () => {
   for (const [name, line] of r3Shapes) {
-    const once = redact(line);
-    assert.equal(redact(once), once, `${name} is not idempotent`);
+    test(`keeps the ${name} run linear: redact() stays under 200ms`, () => {
+      const started = process.hrtime.bigint();
+      redact(line);
+      const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+      assert.ok(elapsedMs < 200, `the ${name} shape took ${elapsedMs.toFixed(0)}ms`);
+    });
   }
+
+  test("keeps masking credential names inside the bounded prefix width", () => {
+    const name64 = "n".repeat(64);
+    const cases: readonly (readonly [string, string])[] = [
+      [`${name64}PASSWORD=${r3Value}`, `${name64}PASSWORD=${REDACTED}`],
+      [`someLongPrefix_api_key=abcd1234`, `someLongPrefix_api_key=${REDACTED}`],
+      [`x-api-key: ${r3Token}`, `x-api-key: ${REDACTED}`],
+    ];
+
+    cases.forEach(([line, expected], index) => {
+      const output = redact(line);
+      assertNoSecret(output, [r3Value, r3Token, "abcd1234"], `bounded prefix ${index}`);
+      assert.ok(output === expected, `bounded prefix ${index} did not keep its shape`);
+      assert.ok(redact(output) === output, `bounded prefix ${index} is not idempotent`);
+    });
+  });
+
+  test("pins the accepted width boundary: a name past the cap loses only its own match", () => {
+    const line = `${"x".repeat(80)}PASSWORD=${r3Value}`;
+
+    assert.ok(redact(line) === line, "a contiguous name past the cap was matched anyway");
+  });
+
+  test("stays idempotent on the adversarial separator runs", () => {
+    for (const [name, line] of r3Shapes) {
+      const once = redact(line);
+      assert.ok(redact(once) === once, `${name} is not idempotent`);
+    }
+  });
+
+  /** Pin the existing overlap behavior without echoing credential-shaped dummies on failure. */
+  const r3AssertBoundary = (label: string, line: string, shouldMask: boolean): void => {
+    const output = redact(line);
+    if (shouldMask) {
+      assert.ok(output !== line, `${label}: the line was not changed`);
+      assert.ok(output.includes(REDACTED), `${label}: no redaction marker`);
+      assert.ok(!output.includes(r3Value), `${label}: the dummy value survived`);
+    } else {
+      assert.ok(output === line, `${label}: an over-cap contiguous key was changed`);
+      assert.ok(!output.includes(REDACTED), `${label}: an unexpected redaction marker`);
+    }
+    assert.ok(redact(output) === output, `${label}: redaction is not idempotent`);
+  };
+
+  for (const [label, length, shouldMask] of [
+    ["63 contiguous name characters", 63, true],
+    ["64 contiguous name characters", 64, true],
+    ["65 contiguous name characters", 65, false],
+  ] as const) {
+    test(`R3 acceptance: ${label}`, () => {
+      r3AssertBoundary(label, `${"x".repeat(length)}PASSWORD=${r3Value}`, shouldMask);
+    });
+  }
+
+  test("R3 acceptance: 65 name characters with an internal hyphen can mask from a later boundary", () => {
+    r3AssertBoundary("65-character name with hyphen", `x-${"x".repeat(63)}PASSWORD=${r3Value}`, true);
+  });
+
+  for (const segments of [7, 8, 9]) {
+    for (const separator of ["hyphen", "underscore"] as const) {
+      const character = separator === "hyphen" ? "-" : "_";
+      const shouldMask = segments <= 8 || separator === "hyphen";
+      test(`R3 acceptance: ${segments} long API segments with ${separator}`, () => {
+        r3AssertBoundary(
+          `${segments} long segments with ${separator}`,
+          `${("x".repeat(70) + character).repeat(segments)}api_key=${r3Value}`,
+          shouldMask,
+        );
+      });
+    }
+  }
+
+  test("R3 acceptance: nine short underscore API segments can mask through another rule", () => {
+    r3AssertBoundary("nine short underscore segments", `${"x_".repeat(9)}api_key=${r3Value}`, true);
+  });
+
+  test("R3 acceptance: an over-cap contiguous name does not prevent a separate field from masking", () => {
+    const overCap = `${"x".repeat(80)}PASSWORD=${r3Value}`;
+    const input = `${overCap} note=x_x_x_x_PASSWORD=${r3Value}`;
+    const output = redact(input);
+    assert.ok(output === `${overCap} note=x_x_x_x_PASSWORD=${REDACTED}`, "a separate field was dropped or not masked");
+    assert.ok(redact(output) === output, "the partially redacted line is not idempotent");
+  });
 });

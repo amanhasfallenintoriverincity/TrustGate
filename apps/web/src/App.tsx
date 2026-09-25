@@ -1,8 +1,13 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 
 import {
-  startFixtureRun,
   type ExecutionResult,
   type ExecutionVerdict,
   type JsonValue,
@@ -11,6 +16,9 @@ import {
   type RunResponse,
   type RunTest,
 } from "./lib/api";
+import Setup from "./Setup";
+import { startWorkspaceRun, type SetupStatus } from "./lib/setup";
+import { installSkill, type SkillAgent } from "./lib/skills";
 
 type Tone = "done" | "wait" | "danger";
 
@@ -39,14 +47,14 @@ type EvidenceCard = {
 
 /**
  * 실행 상태는 네 단계뿐입니다. polling·WebSocket은 쓰지 않습니다(YAGNI): 오케스트레이터가
- * fixture 실행을 한 번에 끝내고 201로 최종 보고서를 돌려주므로, 브라우저는 요청 하나를
+ * workspace 실행을 한 번에 끝내고 201로 최종 보고서를 돌려주므로, 브라우저는 요청 하나를
  * 기다렸다가 결과를 그립니다.
  */
 type RunState =
   | { readonly phase: "idle" }
-  | { readonly phase: "running" }
+  | { readonly phase: "running"; readonly source: "workspace" }
   | { readonly phase: "success"; readonly report: RunResponse }
-  | { readonly phase: "error"; readonly message: string };
+  | { readonly phase: "error"; readonly source: "workspace"; readonly message: string };
 
 const TONE_ICON: Record<Tone, string> = {
   done: "✓",
@@ -87,101 +95,26 @@ const REGRESSION_TONES: Record<RegressionVerdict, Tone> = {
   UNVERIFIED: "wait",
 };
 
-const SAMPLE_BADGE = "샘플 값";
 const RESULT_BADGE = "실제 실행 결과";
 
-const SAMPLE_METRIC_FOOT =
-  "아직 실행하지 않아 fixture-plan.json 기준 예시 값을 보여줍니다. 위 버튼을 누르면 실제 실행 결과로 바뀝니다.";
-
 const RESULT_METRIC_FOOT =
-  "숫자는 fixture-plan.json을 실행한 결과에서 계산했습니다. 판정은 격리 실행 결과가 정합니다.";
+  "숫자는 이번 workspace 실행 보고서에서 계산했습니다. 외부 대상의 취약점 확정이나 회귀 통과를 보증하지 않습니다.";
 
-const SAMPLE_METRICS: readonly Metric[] = [
-  { label: "검토 파일", value: "2", meta: "OCR 수집" },
-  { label: "도출 가설", value: "2", meta: "LLM 후보" },
-  { label: "재현 확정", value: "3", meta: "수정 전 버전" },
-  { label: "회귀 차단", value: "3", meta: "수정 후 버전" },
+const EMPTY_METRICS: readonly Metric[] = [
+  { label: "검토 파일", value: "—", meta: "분석 결과 없음" },
+  { label: "도출 가설", value: "—", meta: "분석 결과 없음" },
+  { label: "재현 확정", value: "—", meta: "분석 결과 없음" },
+  { label: "회귀 차단", value: "—", meta: "분석 결과 없음" },
 ];
+const EMPTY_STAGES: readonly Stage[] = [];
+const EMPTY_EVIDENCE: readonly EvidenceCard[] = [];
 
 const STAGE_DETAILS = {
   files: "OCR이 diff에서 검토할 파일과 규칙 후보를 고릅니다.",
   hypotheses: "LLM은 가설과 검증 시나리오만 만들고 판정하지 않습니다.",
-  reproduce: "네트워크와 자격 증명을 뺀 컨테이너가 수정 전 버전에 같은 요청을 보냅니다.",
-  regression: "같은 요청을 패치 버전에 보내 차단 여부와 상태 변화를 비교합니다.",
+  reproduce: "격리 컨테이너에서 수정 전 상태를 실행해 가설을 검증합니다.",
+  regression: "수정 전·후 상태를 비교해 재현과 회귀 판정을 함께 남깁니다.",
 } as const;
-
-const SAMPLE_STAGES: readonly Stage[] = [
-  {
-    id: "files",
-    title: "변경 파일",
-    tone: "done",
-    statusLabel: "수집 완료",
-    detail: STAGE_DETAILS.files,
-    meta: "server.ts, store.ts",
-  },
-  {
-    id: "hypotheses",
-    title: "취약점 가설",
-    tone: "done",
-    statusLabel: "후보 2건",
-    detail: STAGE_DETAILS.hypotheses,
-    meta: "가격 조작, 소유권 우회",
-  },
-  {
-    id: "reproduce",
-    title: "격리 재현",
-    tone: "done",
-    statusLabel: "재현 3건",
-    detail: STAGE_DETAILS.reproduce,
-    meta: "수정 전 버전 기준",
-  },
-  {
-    id: "regression",
-    title: "패치 회귀 검증",
-    tone: "done",
-    statusLabel: "차단 3건",
-    detail: STAGE_DETAILS.regression,
-    meta: "수정 후 버전 기준",
-  },
-];
-
-const SAMPLE_EVIDENCE: readonly EvidenceCard[] = [
-  {
-    title: "요청",
-    tone: "wait",
-    statusLabel: "재현 시나리오",
-    body: `POST /api/purchase\n{ "itemId": "sword", "price": -100 }`,
-    caption: "가설 price-authority의 테스트 negative-price",
-  },
-  {
-    title: "수정 전 응답",
-    tone: "danger",
-    statusLabel: "취약 재현됨",
-    body: `HTTP 200\n{ "balance": 100 }`,
-    caption: "기대 400, 실제 200",
-  },
-  {
-    title: "수정 후 응답",
-    tone: "done",
-    statusLabel: "차단 확인",
-    body: `HTTP 400\n{ "balance": 0 }`,
-    caption: "기대 400, 실제 400",
-  },
-  {
-    title: "판정",
-    tone: "done",
-    statusLabel: "회귀 통과",
-    body: `수정 전: 재현 확인\n수정 후: 차단 확인\n회귀 판정: 통과`,
-    caption: "두 컨테이너의 실행 결과 비교",
-  },
-];
-
-const MAINTENANCE_NOTES: readonly string[] = [
-  "이 화면은 결과를 읽기만 합니다. 분석은 오케스트레이터가 맡고 브라우저는 증거를 보여줍니다.",
-  "팝업과 대화상자를 쓰지 않습니다. 진행 상태와 오류는 페이지 안 문장으로 표시합니다.",
-  "360px 폭까지 가로 스크롤 없이 읽히도록 맞췄습니다.",
-  "LLM은 가설만 만들고, 판정은 격리 컨테이너의 실행 결과가 정합니다.",
-];
 
 const THIRD_PARTY_NOTICES: readonly string[] = [
   "OpenCodeReview 1.12.6, Apache-2.0",
@@ -213,7 +146,7 @@ const reportMetrics = (report: RunResponse): readonly Metric[] => {
     {
       label: "검토 파일",
       value: String(report.reviewedFiles.length),
-      meta: "fixture 실행 대상",
+      meta: report.source === "workspace" ? "프로젝트 실행 대상" : "fixture 실행 대상",
     },
     { label: "도출 가설", value: String(report.hypotheses.length), meta: "LLM 후보" },
     {
@@ -364,18 +297,73 @@ const reportEvidence = (report: RunResponse): readonly EvidenceCard[] => {
 const statusNotice = (
   run: RunState,
 ): { readonly tone: Tone; readonly text: string } | null => {
-  if (run.phase === "running") return { tone: "wait", text: "fixture 분석을 실행하는 중입니다…" };
-  if (run.phase === "success") {
-    return { tone: "done", text: `분석 완료 — 실행 ${run.report.runId}` };
-  }
+  if (run.phase === "running") return { tone: "wait", text: "프로젝트 분석을 실행하는 중입니다…" };
+  if (run.phase === "success") return { tone: "done", text: `프로젝트 분석 완료 — 실행 ${run.report.runId}` };
   if (run.phase === "error") return { tone: "danger", text: run.message };
   return null;
 };
 
-const FAILURE_MESSAGE = "분석 실행이 실패했습니다";
+const AGENTS: readonly { readonly id: SkillAgent; readonly label: string; readonly detail: string }[] = [
+  { id: "codex", label: "Codex", detail: "프로젝트 스킬" },
+  { id: "claude", label: "Claude", detail: "프로젝트 스킬" },
+  { id: "cursor", label: "Cursor", detail: "프로젝트 스킬" },
+  { id: "hermes", label: "Hermes", detail: "설치 후 사용자가 직접 신뢰 확인" },
+];
+
+type WorkflowStep = "dashboard" | "setup" | "project" | "skills" | "results";
+const WORKFLOW_STEPS: readonly { readonly id: WorkflowStep; readonly label: string }[] = [
+  { id: "dashboard", label: "대시보드" },
+  { id: "setup", label: "연결 설정" },
+  { id: "project", label: "프로젝트 선택/분석" },
+  { id: "skills", label: "에이전트 스킬" },
+  { id: "results", label: "결과 확인" },
+];
+const stepFromLocation = (): WorkflowStep => {
+  const step = window.location.hash.slice(2);
+  return WORKFLOW_STEPS.find(({ id }) => id === step)?.id ?? "dashboard";
+};
+type SkillState = "idle" | "pending" | "installed" | "exists" | "error";
 
 export default function App(): JSX.Element {
   const [run, setRun] = useState<RunState>({ phase: "idle" });
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [setupOpenSignal, setSetupOpenSignal] = useState(0);
+  const [repoPath, setRepoPath] = useState("");
+  const [activeStep, setActiveStep] = useState<WorkflowStep>(stepFromLocation);
+  const [skills, setSkills] = useState<Partial<Record<SkillAgent, SkillState>>>({});
+  const installing = useRef<Set<SkillAgent>>(new Set());
+  const workspaceMode = setupStatus?.mode === "workspace";
+
+  useEffect(() => {
+    const syncLocation = (): void => setActiveStep(stepFromLocation());
+    window.addEventListener("popstate", syncLocation);
+    window.addEventListener("hashchange", syncLocation);
+    return () => {
+      window.removeEventListener("popstate", syncLocation);
+      window.removeEventListener("hashchange", syncLocation);
+    };
+  }, []);
+
+  const navigate = (step: WorkflowStep): void => {
+    if (window.location.hash !== `#/${step}`) window.history.pushState(null, "", `#/${step}`);
+    setActiveStep(step);
+    if (step === "setup") setSetupOpenSignal((current) => current + 1);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  };
+
+  const handleInstall = (agent: SkillAgent): void => {
+    if (!workspaceMode || installing.current.has(agent)) return;
+    installing.current.add(agent);
+    setSkills((current) => ({ ...current, [agent]: "pending" }));
+    void installSkill(agent).then((result) => {
+      setSkills((current) => ({ ...current, [agent]: result }));
+    }, () => {
+      setSkills((current) => ({ ...current, [agent]: "error" }));
+    }).finally(() => {
+      installing.current.delete(agent);
+    });
+  };
   /**
    * 재진입 가드입니다. `disabled`는 다음 렌더 뒤에야 붙으므로, 같은 태스크에서 두 번
    * 눌리면 POST가 두 번 나가고 나중에 끝난 응답이 화면을 덮어씁니다. 상태 대신 ref로
@@ -384,18 +372,21 @@ export default function App(): JSX.Element {
   const isRunningRef = useRef(false);
 
   const handleRun = (): void => {
-    if (isRunningRef.current) return; // 임계 구역 밖: 중복 요청은 여기서 끝냅니다.
+    if (isRunningRef.current || !workspaceMode || !setupStatus?.configured) return;
+    // 임계 구역 밖: 중복 요청과 서버 모드에 맞지 않는 요청은 여기서 끝냅니다.
     isRunningRef.current = true;
-    setRun({ phase: "running" });
-    void startFixtureRun()
+    setRun({ phase: "running", source: "workspace" });
+    navigate("results");
+    void startWorkspaceRun(repoPath)
       .then(
         (report) => {
           setRun({ phase: "success", report });
         },
-        (error: unknown) => {
+        () => {
           setRun({
             phase: "error",
-            message: error instanceof Error ? error.message : FAILURE_MESSAGE,
+            source: "workspace",
+            message: "프로젝트 분석에 실패했습니다. 서버 설정과 저장소 경로를 확인해 주세요.",
           });
         },
       )
@@ -405,53 +396,121 @@ export default function App(): JSX.Element {
   };
 
   const isSuccess = run.phase === "success";
-  const metrics = isSuccess ? reportMetrics(run.report) : SAMPLE_METRICS;
-  const stages = isSuccess ? reportStages(run.report) : SAMPLE_STAGES;
-  const evidence = isSuccess ? reportEvidence(run.report) : SAMPLE_EVIDENCE;
+  const hasAttempt = run.phase !== "idle";
+  const metrics: readonly Metric[] = isSuccess
+    ? reportMetrics(run.report)
+    : EMPTY_METRICS;
+  const stages = isSuccess ? reportStages(run.report) : EMPTY_STAGES;
+  const evidence = isSuccess ? reportEvidence(run.report) : EMPTY_EVIDENCE;
   const notice = statusNotice(run);
   const badgeTone: Tone = isSuccess ? "done" : "wait";
 
   return (
-    <main className="app-shell">
-      <header className="app-header">
-        <p className="brand">TrustGate</p>
-        <h1 className="headline">신뢰 경계와 비즈니스 로직 취약점을 실행 증거로 확인합니다</h1>
-        <p className="lede">
-          변경 파일에서 가설을 세우고, 격리 컨테이너에서 재현한 뒤, 패치 버전의 회귀까지 한 페이지에서
-          확인합니다. 진행 상태와 판정 근거는 팝업 없이 이 화면에 바로 쌓입니다.
-        </p>
-        <div className="header-actions">
-          <button
-            type="button"
-            className="action"
-            onClick={handleRun}
-            disabled={run.phase === "running"}
-          >
-            샘플 분석 실행
-          </button>
-          <span className="action-meta">fixture 모드 · 유료 API 호출 없음</span>
-        </div>
-        {/* 노드가 클릭 시점에 삽입되면 보조기술이 낭독을 놓치므로 리전을 항상 렌더하고
-            자식만 조건부로 채웁니다. 비어 있을 때는 CSS :empty가 1px 시각적 숨김으로
-            화면에서만 지우고, 접근성 트리에는 role=status로 남깁니다(display: none 금지). */}
-        <p className="action-notice" role="status" aria-live="polite">
-          {notice === null ? null : (
-            <>
-              <span aria-hidden="true">{TONE_ICON[notice.tone]}</span>
-              {notice.text}
-            </>
-          )}
-        </p>
-      </header>
+    <div className="app-shell">
+      <div className="topbar">
+        <div className="topbar-brand"><span className="brand-mark" aria-hidden="true">T</span><span className="brand">TrustGate</span></div>
+        <span className="topbar-location">분석 워크스페이스 <span aria-hidden="true">/</span> {WORKFLOW_STEPS.find(({ id }) => id === activeStep)?.label}</span>
+        <span className="topbar-mode">{setupStatus === null ? "모드 확인 중" : workspaceMode ? "WORKSPACE · 서버 고정" : "FIXTURE · 저장된 재생"}</span>
+      </div>
+      <aside className="sidebar">
+        <p className="sidebar-label">WORKFLOW</p>
+        <nav aria-label="주 메뉴" className="sidebar-nav">
+          {WORKFLOW_STEPS.map(({ id, label }, index) => (
+            <Button key={id} type="button" variant="ghost" className={cn("sidebar-link", activeStep === id && "is-active")}
+              onClick={() => navigate(id)} aria-current={activeStep === id ? "page" : undefined}>
+              <span className="sidebar-index" aria-hidden="true">0{index + 1}</span>{label}
+            </Button>
+          ))}
+        </nav>
+        <div className="sidebar-bottom"><span>LOCAL / TRUSTGATE</span><span>브라우저에서는 루트 변경 불가</span></div>
+      </aside>
+      <main className="page-content">
+        <header className="run-controls">
+          <h1 className="sr-only">TrustGate 분석 워크스페이스</h1>
+          {/* 항상 존재하는 라이브 리전: CSS :empty는 시각적으로만 숨깁니다. */}
+          <p className="action-notice" role="status" aria-live="polite">
+            {notice === null ? null : <><span aria-hidden="true">{TONE_ICON[notice.tone]}</span>{notice.text}</>}
+          </p>
+        </header>
 
-      <section aria-label="요약 지표" className="surface">
-        <div className="section-head">
-          <h2>요약 지표</h2>
-          <span className={statusClass(badgeTone)}>
-            <span aria-hidden="true">{TONE_ICON[badgeTone]}</span>
-            {isSuccess ? RESULT_BADGE : SAMPLE_BADGE}
-          </span>
+        {/* Keep the setup draft mounted across pages without exposing inactive content. */}
+        <div hidden={activeStep !== "setup"}>
+          <Setup onStatusChange={setSetupStatus} openSignal={setupOpenSignal} />
         </div>
+
+        {activeStep === "dashboard" && <div className="dashboard-home">
+          <div className="dashboard-heading">
+            <div><span className="eyebrow">TRUSTGATE / OVERVIEW</span><h1>보안 분석 대시보드</h1><p className="section-note">AI가 취약점 가설을 세우고 격리 환경에서 검증한 결과를 확인합니다.</p></div>
+            <Button type="button" disabled={run.phase === "running" || !workspaceMode || !setupStatus?.configured} onClick={handleRun}>{run.phase === "running" ? "분석 중…" : "프로젝트 분석 시작"}</Button>
+          </div>
+          <div className="dashboard-metrics" aria-label="분석 요약">
+            {metrics.map((metric) => <Card className="dashboard-metric" key={metric.label}><span className="metric-label">{metric.label}</span><strong className="metric-value">{metric.value}</strong><span className="metric-meta">{metric.meta}</span></Card>)}
+          </div>
+          <div className="dashboard-panels">
+            <Card as="section" className="surface" aria-label="분석 대상">
+              <CardHeader className="section-head"><h2>분석 대상</h2><span className="status status-wait">{workspaceMode ? "WORKSPACE" : "설정 필요"}</span></CardHeader>
+              <CardContent className="workspace-fields">
+                <Field className="workspace-path"><FieldLabel htmlFor="dashboard-repo-path">저장소 상대 경로</FieldLabel><Input id="dashboard-repo-path" value={repoPath} maxLength={512} spellCheck={false} autoComplete="off" placeholder="비워두면 서버의 기본 저장소 루트" onChange={(event) => setRepoPath(event.target.value)} /></Field>
+                <p className="section-note">서버가 허용한 루트 안에서만 분석합니다. 경로를 비우면 기본 루트를 사용합니다.</p>
+                {(!workspaceMode || !setupStatus?.configured) && <p className="section-note">분석을 시작하려면 운영자가 서버를 workspace 모드로 실행하고 연결 설정을 저장해야 합니다.</p>}
+              </CardContent>
+            </Card>
+            <Card as="section" className="surface" aria-label="최근 분석 상태">
+              <CardHeader className="section-head"><h2>최근 분석 상태</h2><span className={statusClass(run.phase === "error" ? "danger" : run.phase === "success" ? "done" : "wait")}>{run.phase === "running" ? "진행 중" : run.phase === "success" ? "완료" : run.phase === "error" ? "실패" : "실행 기록 없음"}</span></CardHeader>
+              <p className="section-note">{notice?.text ?? "분석을 실행하면 이 세션의 결과가 표시됩니다. 이전 실행 기록은 불러오지 않습니다."}</p>
+              {run.phase === "success" && <Button type="button" variant="outline" onClick={() => navigate("results")}>검증 근거 보기</Button>}
+              {run.phase === "error" && <p className="section-note">설정과 허용된 프로젝트 경로를 확인한 뒤 다시 실행하세요.</p>}
+            </Card>
+          </div>
+          <div className="dashboard-shortcuts"><Button type="button" variant="outline" onClick={() => navigate("setup")}>연결 설정</Button><Button type="button" variant="outline" onClick={() => navigate("results")}>결과 확인</Button><Button type="button" variant="outline" onClick={() => navigate("skills")}>에이전트 스킬</Button></div>
+        </div>}
+
+        {activeStep === "project" && <div id="project" className="project-group">
+          <div className="group-heading"><span className="eyebrow">02 / TARGET</span><h2>프로젝트 선택/분석</h2></div>
+          <p className="section-note">workspace 대상은 운영자가 서버 시작 전에 지정한 루트 아래로 제한됩니다. 브라우저에서 임의의 절대 경로를 선택할 수 없습니다.</p>
+          {setupStatus?.mode === "workspace" && setupStatus.configured ? (
+            <Card as="section" aria-label="프로젝트 분석" className="surface workspace-run">
+              <CardHeader className="section-head"><h2>프로젝트 분석</h2><p className="section-note">저장한 설정으로 허용 루트 안의 프로젝트를 분석합니다.</p></CardHeader>
+              <CardContent className="workspace-fields">
+                <Field className="workspace-path"><FieldLabel htmlFor="repo-path">저장소 상대 경로</FieldLabel>
+                  <Input id="repo-path" value={repoPath} maxLength={512} spellCheck={false} autoComplete="off" placeholder="비워두면 서버의 기본 저장소 루트"
+                    onChange={(event) => setRepoPath(event.target.value)} />
+                </Field>
+                <p className="section-note">서버의 허용 루트 기준 상대 경로입니다. 비워두면 기본 저장소 루트를 분석합니다.</p>
+                <Button type="button" size="lg" disabled={run.phase === "running"} onClick={handleRun}>프로젝트 분석</Button>
+              </CardContent>
+            </Card>
+          ) : (
+            <Card className="surface unavailable-panel"><strong>프로젝트 분석을 시작하려면 서버를 workspace 모드로 실행하세요</strong><p className="section-note">{workspaceMode ? "연결 설정을 저장한 다음 다시 시도해 주세요." : "연결 설정에서 제공자 정보를 저장한 뒤 TRUSTGATE_MODE=workspace와 TRUSTGATE_WORKSPACE_ROOT로 서버를 다시 시작해 주세요."}</p></Card>
+          )}
+        </div>}
+
+        {activeStep === "skills" && <Card as="section" id="skills" aria-label="에이전트 스킬" className="surface skills-panel">
+          <CardHeader className="section-head"><div><span className="eyebrow">03 / AGENTS</span><h2>에이전트 스킬</h2></div><span className="panel-meta">수동 설치 · 자동 실행 없음</span></CardHeader>
+          <p className="section-note">각 에이전트의 프로젝트 스킬을 개별적으로 설치합니다. 운영자가 허용 루트를 지정하고 workspace 모드로 서버를 다시 시작해야 합니다. 브라우저는 루트를 지정하지 않습니다.</p>
+          {workspaceMode && <p className="section-note">서버 실행 전 <code>TRUSTGATE_WORKSPACE_ROOT</code>와 <code>TRUSTGATE_MODE=workspace</code>를 운영자가 설정했는지 확인하세요. 실제 루트 고정 여부와 설치 가능 여부는 서버가 요청 시 재검증합니다.</p>}
+          <div className="agent-grid">{AGENTS.map(({ id, label, detail }) => {
+            const state = skills[id] ?? "idle";
+            return <div className="agent-row" key={id}>
+              <div className="agent-copy"><strong>{label}</strong><span>{detail}</span></div>
+              <Button variant="outline" size="sm" type="button" disabled={!workspaceMode || state === "pending" || state === "installed"} onClick={() => handleInstall(id)}>{label} 스킬 설치</Button>
+              <p className={`agent-feedback agent-feedback-${state}`} aria-live="polite">
+                {state === "pending" ? `${label} 설치 요청 중…` : state === "installed" ? `${label} 설치 완료` : state === "exists" ? `${label} 스킬이 이미 설치되어 있습니다. 기존 파일을 덮어쓰지 않았습니다.` : state === "error" ? `${label} 스킬을 설치하지 못했습니다. 서버 설정을 확인하고 다시 시도하세요.` : !workspaceMode ? "workspace 모드에서만 설치할 수 있습니다." : "명시적으로 설치 버튼을 누를 때만 요청합니다."}
+              </p>
+            </div>;
+          })}</div>
+          <p className="section-note skill-caution">Hermes 스킬은 파일 설치만으로 신뢰되지 않습니다. Hermes에서 직접 내용을 검토하고 신뢰를 승인하세요. 에이전트의 재시작이 필요할 수 있으며 이 페이지는 재시작하지 않습니다.</p>
+        </Card>}
+
+        {activeStep === "results" && <div id="results" className="results-group"><div className="group-heading"><span className="eyebrow">04 / EVIDENCE</span><h2>결과 확인</h2></div>
+        <Card as="section" aria-label="요약 지표" className="surface">
+        <CardHeader className="section-head">
+          <h2>요약 지표</h2>
+          <Badge variant="outline" className={statusClass(badgeTone)}>
+            <span aria-hidden="true">{TONE_ICON[badgeTone]}</span>
+            {isSuccess ? RESULT_BADGE : hasAttempt ? run.phase === "running" ? "프로젝트 분석 대기 중" : "프로젝트 분석 실패" : "분석 결과 없음"}
+          </Badge>
+        </CardHeader>
         <ul className="metric-grid">
           {metrics.map((metric) => (
             <li key={metric.label} className="metric">
@@ -461,63 +520,62 @@ export default function App(): JSX.Element {
             </li>
           ))}
         </ul>
-        <p className="section-foot">{isSuccess ? RESULT_METRIC_FOOT : SAMPLE_METRIC_FOOT}</p>
-      </section>
+        <p className="section-foot">{isSuccess ? RESULT_METRIC_FOOT : hasAttempt ? "프로젝트 실행 결과가 없어 지표를 표시할 수 없습니다." : "프로젝트 분석을 실행하면 여기서 지표를 계산합니다."}</p>
+      </Card>
 
-      <section aria-label="분석 흐름" className="surface flow">
-        <div className="section-head">
+      <Card as="section" aria-label="분석 흐름" className="surface flow">
+        <CardHeader className="section-head">
           <h2>분석 흐름</h2>
           <p className="section-note">
             {isSuccess
-              ? "방금 실행한 fixture 분석의 단계별 결과입니다."
-              : "네 단계가 끝나면 단계마다 판정 근거가 남습니다."}
+              ? "방금 실행한 workspace 프로젝트 분석의 단계별 결과입니다."
+              : hasAttempt ? "프로젝트 분석 단계의 결과가 아직 없습니다." : "프로젝트 분석을 실행하면 단계마다 판정 근거가 남습니다."}
           </p>
-        </div>
+        </CardHeader>
         {stages.map((stage) => (
-          <article key={stage.id} className="card">
+          <Card as="article" size="sm" key={stage.id} className="card">
             <h3 className="card-title">{stage.title}</h3>
-            <p className={statusClass(stage.tone)}>
+            <Badge variant="outline" className={statusClass(stage.tone)}>
               <span aria-hidden="true">{TONE_ICON[stage.tone]}</span>
               {stage.statusLabel}
-            </p>
+            </Badge>
             <p className="card-body">{stage.detail}</p>
             <p className="card-meta">{stage.meta}</p>
-          </article>
+          </Card>
         ))}
-      </section>
+        {!isSuccess && <p className="section-note">분석 결과 없음 · 완료된 단계가 없습니다.</p>}
+      </Card>
 
-      <section aria-label="실행 증거" className="surface evidence">
-        <div className="section-head">
+      <Card as="section" aria-label="실행 증거" className="surface evidence">
+        <CardHeader className="section-head">
           <h2>실행 증거</h2>
           <p className="section-note">
             {isSuccess
-              ? "첫 테스트의 요청과 두 컨테이너 실행 결과, 그리고 판정입니다."
-              : "요청, 수정 전 응답, 수정 후 응답, 판정을 같은 화면에서 비교합니다."}
+              ? "첫 테스트의 요청과 격리 실행 결과, 그리고 판정입니다."
+              : "프로젝트 분석 결과가 없어 비교할 수 없습니다."}
           </p>
-        </div>
+        </CardHeader>
         {evidence.map((item) => (
-          <article key={item.title} className="card">
+          <Card as="article" size="sm" key={item.title} className="card">
             <h3 className="card-title">{item.title}</h3>
-            <p className={statusClass(item.tone)}>
+            <Badge variant="outline" className={statusClass(item.tone)}>
               <span aria-hidden="true">{TONE_ICON[item.tone]}</span>
               {item.statusLabel}
-            </p>
+            </Badge>
             <pre className="evidence-body">
               <code>{item.body}</code>
             </pre>
             <p className="card-meta">{item.caption}</p>
-          </article>
+          </Card>
         ))}
-      </section>
+        {!isSuccess && <p className="section-note">실행 증거 없음 · 결과가 도착하면 표시됩니다.</p>}
+      </Card>
+        </div>}
 
       <footer className="app-footer">
-        <section aria-label="관리 범위" className="footer-block">
-          <h2>관리 범위</h2>
-          <ul className="footer-list">
-            {MAINTENANCE_NOTES.map((note) => (
-              <li key={note}>{note}</li>
-            ))}
-          </ul>
+        <section className="footer-block" aria-label="설정 바로가기">
+          <h2>연결 설정</h2>
+          <Button variant="outline" size="sm" type="button" onClick={() => navigate("setup")}>설정</Button>
         </section>
         <section aria-label="라이선스와 제3자 고지" className="footer-block">
           <h2>라이선스와 제3자 고지</h2>
@@ -529,6 +587,7 @@ export default function App(): JSX.Element {
           <p className="footer-notice">{OAUTH_NOTICE}</p>
         </section>
       </footer>
-    </main>
+      </main>
+    </div>
   );
 }

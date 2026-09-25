@@ -3,9 +3,12 @@
  *
  * Environment:
  * - `TRUSTGATE_MODE` (`fixture` | `workspace`, default `fixture`; any other value refuses to start)
+ * - `TRUSTGATE_WORKSPACE_ROOT` (required in workspace mode: absolute existing directory
+ *   selected by the operator; fixture mode ignores it)
  * - `TRUSTGATE_HOST` / `TRUSTGATE_PORT` (default 127.0.0.1:8787)
- * - workspace runs additionally need `TRUSTGATE_LLM_BASE_URL`, `TRUSTGATE_LLM_MODEL`,
- *   and `TRUSTGATE_SANDBOX_IMAGE`.
+ * - workspace runs use nonsecret settings saved by `/api/setup` first, falling back to
+ *   `TRUSTGATE_LLM_BASE_URL`, `TRUSTGATE_LLM_MODEL`, and `TRUSTGATE_SANDBOX_IMAGE`.
+ *   Save does not connect; `/api/setup/test` explicitly tests the configured endpoint.
  *
  * Logs are JSON lines built from the server's non-sensitive log records only. Configuration and
  * listen failures emit a fixed `{"event":"server.failed","reason":...}` record: never a stack
@@ -17,7 +20,8 @@
  * removed before it is written. A record that cannot be serialized or redacted is replaced by
  * `REDACTION_FAILURE_LINE`, never written raw and never dropped silently.
  */
-import { realpathSync, writeSync } from "node:fs";
+import { realpathSync, statSync, writeSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { serializeLogLine } from "./redaction.js";
@@ -27,7 +31,7 @@ const DEFAULT_PORT = 8787;
 const DEFAULT_HOST = "127.0.0.1";
 const SHUTDOWN_GRACE_MS = 10_000;
 
-export type ConfigFailureReason = "invalid_mode" | "invalid_port";
+export type ConfigFailureReason = "invalid_mode" | "invalid_port" | "invalid_workspace_root";
 export type ServerFailureReason = ConfigFailureReason | "listen" | "shutdown";
 
 /** Every record this entry point can write; a closed union of non-sensitive fields. */
@@ -69,6 +73,19 @@ export const readPort = (value: string | undefined): number => {
   const port = Number(value);
   if (port > 65_535) throw new ConfigError("invalid_port");
   return port;
+};
+
+/** Only an operator-selected absolute directory can become the workspace allowlist root. */
+export const readWorkspaceRoot = (value: string | undefined, mode: ServerMode): string | undefined => {
+  if (mode === "fixture") return undefined;
+  if (value === undefined || !isAbsolute(value)) throw new ConfigError("invalid_workspace_root");
+  try {
+    const realPath = realpathSync(value);
+    if (statSync(realPath).isDirectory()) return value;
+  } catch {
+    // Missing paths and inaccessible directories fail before the server begins listening.
+  }
+  throw new ConfigError("invalid_workspace_root");
 };
 
 let stdoutErrorGuarded = false;
@@ -181,10 +198,12 @@ export const run = async (): Promise<void> => {
   let mode: ServerMode;
   let host: string;
   let port: number;
+  let rootDir: string | undefined;
   try {
     mode = readMode(process.env.TRUSTGATE_MODE);
     host = process.env.TRUSTGATE_HOST ?? DEFAULT_HOST;
     port = readPort(process.env.TRUSTGATE_PORT);
+    rootDir = readWorkspaceRoot(process.env.TRUSTGATE_WORKSPACE_ROOT, mode);
   } catch (error) {
     log({
       event: "server.failed",
@@ -194,7 +213,7 @@ export const run = async (): Promise<void> => {
     return;
   }
 
-  const app = buildServer({ mode, log: (record) => writeLog(record) });
+  const app = buildServer({ mode, ...(rootDir === undefined ? {} : { rootDir }), log: (record) => writeLog(record) });
   installShutdownHandlers({
     close: () => app.close(),
     log,

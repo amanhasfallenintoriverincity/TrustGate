@@ -1,11 +1,70 @@
+import { lstat, realpath } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { devNull } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 
 import { execa } from "execa";
 
 const require = createRequire(import.meta.url);
-const ocrLauncher = require.resolve(
-  "@alibaba-group/open-code-review/bin/ocr.js",
-);
+// OCR invokes repository-aware Git, so the repository's config and attributes
+// are executable control input. This Linux-only boundary requires bubblewrap
+// and the trusted platform OCR package; missing either fails closed. It assumes
+// the host binary/package and checkout root are trusted and no same-user actor
+// concurrently swaps checkout ancestors while it is bound into the namespace.
+const BWRAP = "/usr/bin/bwrap";
+const SANDBOX_REPO = "/repo";
+const SANDBOX_OCR = "/ocr";
+const OCR_TIMEOUT_MS = 30_000;
+
+const getNativeOcr = async (): Promise<string> => {
+  const packageName = `@alibaba-group/ocr-${process.platform}-${process.arch}`;
+  const packageJson = require.resolve(`${packageName}/package.json`);
+  const binary = await realpath(join(dirname(packageJson), "bin", "opencodereview"));
+  if (!(await lstat(binary)).isFile()) {
+    throw new Error("OCR binary is not a regular file");
+  }
+  return binary;
+};
+
+const sandboxArgs = (repo: string, binary: string, args: string[]): string[] => [
+  "--unshare-all",
+  "--die-with-parent",
+  "--new-session",
+  "--cap-drop", "ALL",
+  "--ro-bind", "/usr", "/usr",
+  "--ro-bind", "/bin", "/bin",
+  "--ro-bind", "/lib", "/lib",
+  "--ro-bind", "/lib64", "/lib64",
+  "--ro-bind", binary, SANDBOX_OCR,
+  "--ro-bind", repo, SANDBOX_REPO,
+  "--proc", "/proc",
+  "--dev", "/dev",
+  "--tmpfs", "/tmp",
+  "--dir", "/home",
+  "--clearenv",
+  "--setenv", "PATH", "/usr/bin:/bin",
+  "--setenv", "HOME", "/tmp",
+  "--setenv", "XDG_CONFIG_HOME", "/tmp/.config",
+  "--setenv", "GIT_CONFIG_NOSYSTEM", "1",
+  "--setenv", "GIT_CONFIG_GLOBAL", devNull,
+  "--setenv", "GIT_ATTR_NOSYSTEM", "1",
+  "--setenv", "GIT_TERMINAL_PROMPT", "0",
+  "--setenv", "GIT_NO_REPLACE_OBJECTS", "1",
+  "--setenv", "GIT_OPTIONAL_LOCKS", "0",
+  "--setenv", "GIT_CONFIG_COUNT", "1",
+  "--setenv", "GIT_CONFIG_KEY_0", "core.fsmonitor",
+  "--setenv", "GIT_CONFIG_VALUE_0", "false",
+  "--setenv", "GIT_PAGER", "cat",
+  "--setenv", "OCR_NO_UPDATE", "1",
+  "--chdir", SANDBOX_REPO,
+  "--", SANDBOX_OCR,
+  ...args.map((arg, index) =>
+    index > 0 && args[index - 1] === "--repo" &&
+    args.slice(0, index).indexOf("--") === -1
+      ? SANDBOX_REPO
+      : arg,
+  ),
+];
 
 export type ReviewInput = {
   mode: "workspace" | "range" | "commit";
@@ -78,6 +137,9 @@ const parsePreview = (
   }
   if (!Array.isArray(preview.reviewable_files)) {
     throw new Error("OCR preview: reviewable_files must be an array");
+  }
+  if (preview.reviewable_files.length > 64) {
+    throw new Error("OCR preview: expected at most 64 reviewable files");
   }
 
   const seenPaths = new Set<string>();
@@ -174,12 +236,25 @@ const parseRuleGroups = (
 };
 
 export const runOcrProcess: RunOcr = async (args, repo) => {
-  const result = await execa(process.execPath, [ocrLauncher, ...args], {
-    cwd: repo,
-    env: { ...process.env, OCR_NO_UPDATE: "1" },
-    timeout: 30_000,
+  if (process.platform !== "linux" || !isAbsolute(repo)) {
+    throw new Error("OCR collection requires an absolute repository path and a Linux sandbox");
+  }
+  const root = await realpath(repo);
+  if (!(await lstat(root)).isDirectory()) {
+    throw new Error("OCR repository root is not a directory");
+  }
+  const binary = await getNativeOcr();
+  // OCR reads untrusted Git config and can execute repository helpers. Run it
+  // behind a read-only, networkless mount namespace with no host secrets, not
+  // merely a filtered host environment or Git command-line flags.
+  const result = await execa(BWRAP, sandboxArgs(root, binary, args), {
+    cwd: "/",
+    env: { PATH: "/usr/bin:/bin" },
+    extendEnv: false,
+    timeout: OCR_TIMEOUT_MS,
     reject: true,
     preferLocal: false,
+    shell: false,
     maxBuffer: 1024 * 1024,
   });
   return result.stdout;

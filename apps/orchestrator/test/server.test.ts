@@ -729,7 +729,10 @@ test("workspace runtime failures stay generic and unavailable ones are 503", asy
       throw new Error(`upstream said api_key=${secret}`);
     },
   });
-  const unavailable = buildServer({ mode: "workspace", rootDir: root });
+  const unavailable = buildServer({
+    mode: "workspace", rootDir: root,
+    setupStore: { read: async () => null, save: async () => { throw new Error("not used"); }, readCredential: async () => null, saveCredential: async () => { throw new Error("not used"); } },
+  });
   try {
     const failure = await failing.inject({
       method: "POST",

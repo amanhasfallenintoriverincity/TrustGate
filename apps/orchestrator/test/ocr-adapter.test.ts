@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+
+import { execa } from "execa";
 
 import {
   createOcrAdapter,
@@ -61,6 +64,58 @@ const createFixtureRunner = (
   return { runOcr, calls };
 };
 
+test("OCR collection cannot execute a repository fsmonitor or pass it a host credential", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-hostile-git-"));
+  const marker = join(repo, "..", `ocr-fsmonitor-${randomBytes(8).toString("hex")}`);
+  const leaked = `${marker}.credential`;
+  const credentialName = "TRUSTGATE_OCR_SYNTHETIC_CREDENTIAL";
+  const credential = `synthetic-only-${randomBytes(8).toString("hex")}`;
+  const priorCredential = process.env[credentialName];
+  t.after(async () => {
+    if (priorCredential === undefined) delete process.env[credentialName];
+    else process.env[credentialName] = priorCredential;
+    await rm(repo, { recursive: true, force: true });
+    await rm(marker, { force: true });
+    await rm(leaked, { force: true });
+  });
+
+  await execa("/usr/bin/git", ["init", "-q", repo]);
+  await writeFile(join(repo, "tracked.ts"), "before\n");
+  await execa("/usr/bin/git", ["-C", repo, "add", "tracked.ts"]);
+  await execa("/usr/bin/git", ["-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial"]);
+  await writeFile(join(repo, "tracked.ts"), "after\n");
+
+  const helper = join(repo, "fsmonitor.sh");
+  await writeFile(helper, `#!/bin/sh\nprintf 'executed' > ${JSON.stringify(marker)}\nprintf '%s' "$${credentialName}" > ${JSON.stringify(leaked)}\n`, { mode: 0o755 });
+  await execa("/usr/bin/git", ["-C", repo, "config", "core.fsmonitor", helper]);
+  process.env[credentialName] = credential;
+
+  const result = await createOcrAdapter().collect(repo);
+  assert.notEqual(await readFile(leaked, "utf8").catch(() => undefined), credential, "repository helper read the synthetic credential");
+  assert.equal(await access(marker).then(() => true, () => false), false, "repository helper executed on the host");
+  assert.ok(result.files.some((file) => file.path === "tracked.ts"), `OCR did not collect the tracked change: ${JSON.stringify(result)}`);
+
+  // Positive control: the same metadata is executable by ordinary host Git.
+  // Only the planted synthetic credential is made available to this helper.
+  await execa("/usr/bin/git", ["-C", repo, "status", "--short"]);
+  assert.equal(await readFile(marker, "utf8"), "executed");
+  assert.equal(await readFile(leaked, "utf8"), credential);
+});
+
+test("runOcrProcess preserves literal file paths after the option terminator", async (t) => {
+  const repo = await mkdtemp(join(tmpdir(), "trustgate-ocr-path-"));
+  t.after(async () => rm(repo, { recursive: true, force: true }));
+  await execa("/usr/bin/git", ["init", "-q", repo]);
+  await writeFile(join(repo, "--repo"), "a\n");
+  await writeFile(join(repo, "normal.txt"), "b\n");
+  const output = await runOcrProcess(
+    ["delegate", "rule", "--format", "json", "--repo", repo, "--", "--repo", "normal.txt"],
+    repo,
+  );
+  const parsed = JSON.parse(output) as { groups: Array<{ files: string[] }> };
+  assert.deepEqual(parsed.groups.flatMap((group) => group.files).sort(), ["--repo", "normal.txt"]);
+});
+
 test("runOcrProcess ignores an executable in the target repository", async (t) => {
   const repo = await mkdtemp(join(tmpdir(), "trustgate-hostile-ocr-"));
   t.after(async () => {
@@ -86,15 +141,14 @@ test("runOcrProcess ignores an executable in the target repository", async (t) =
   assert.match(output, /^open-code-review v1\.12\.6\b/);
 });
 
-test("runOcrProcess forces OCR_NO_UPDATE=1 for the launcher", async (t) => {
+test("runOcrProcess never inherits host preload, HOME or credential settings", async (t) => {
   const repo = await mkdtemp(join(tmpdir(), "trustgate-ocr-env-"));
-  const captureVariable = "TRUSTGATE_OCR_ENV_CAPTURE";
+  const capture = join(repo, "..", `ocr-preload-${randomBytes(8).toString("hex")}`);
   const originalEnvironment = {
     HOME: process.env.HOME,
     USERPROFILE: process.env.USERPROFILE,
     NODE_OPTIONS: process.env.NODE_OPTIONS,
     OCR_NO_UPDATE: process.env.OCR_NO_UPDATE,
-    [captureVariable]: process.env[captureVariable],
   };
   t.after(async () => {
     for (const [name, value] of Object.entries(originalEnvironment)) {
@@ -102,48 +156,19 @@ test("runOcrProcess forces OCR_NO_UPDATE=1 for the launcher", async (t) => {
       else process.env[name] = value;
     }
     await rm(repo, { recursive: true, force: true });
+    await rm(capture, { force: true });
   });
 
   const preload = join(repo, "capture-ocr-env.cjs");
-  await writeFile(
-    preload,
-    `const childProcess = require("node:child_process");
-const { appendFileSync } = require("node:fs");
-appendFileSync(
-  process.env.${captureVariable},
-  JSON.stringify(process.env.OCR_NO_UPDATE ?? null) + "\\n",
-);
-const spawn = childProcess.spawn;
-childProcess.spawn = function (command, args, options) {
-  const isUpdater =
-    command === process.execPath &&
-    Array.isArray(args) &&
-    typeof args[0] === "string" &&
-    /[\\\\/]scripts[\\\\/]update\\.js$/.test(args[0]);
-  if (isUpdater) return { unref() {} };
-  return spawn.call(this, command, args, options);
-};
-`,
-  );
-
+  await writeFile(preload, `require("node:fs").writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.env));`);
   process.env.HOME = repo;
   process.env.USERPROFILE = repo;
   process.env.NODE_OPTIONS = `--require=${preload}`;
+  process.env.OCR_NO_UPDATE = "0";
 
-  const observed: Array<string | null> = [];
-  for (const [index, inheritedValue] of [undefined, "", "0"].entries()) {
-    if (inheritedValue === undefined) delete process.env.OCR_NO_UPDATE;
-    else process.env.OCR_NO_UPDATE = inheritedValue;
-
-    const capture = join(repo, `ocr-env-${index}.jsonl`);
-    process.env[captureVariable] = capture;
-    await runOcrProcess(["--version"], repo);
-    const lines = (await readFile(capture, "utf8")).trimEnd().split("\n");
-    assert.equal(lines.length, 1, "the controlled launcher ran more than once");
-    observed.push(JSON.parse(lines[0]!) as string | null);
-  }
-
-  assert.deepEqual(observed, ["1", "1", "1"]);
+  const output = await runOcrProcess(["--version"], repo);
+  assert.match(output, /^open-code-review v1\.12\.6\b/);
+  assert.equal(await access(capture).then(() => true, () => false), false, "host preload executed");
 });
 
 test("preview and rule calls are converted into review input", async () => {
@@ -206,6 +231,14 @@ test("option-like file paths are passed after the option terminator", async () =
   await createOcrAdapter(runOcr).collect("/repo");
 
   assert.deepEqual(calls[1]?.args.slice(-2), ["--", path]);
+});
+
+test("OCR refuses over-budget preview before invoking rule", async () => {
+  const { runOcr, calls } = createFixtureRunner(previewWithPaths(
+    Array.from({ length: 65 }, (_, index) => `src/file-${index}.ts`),
+  ));
+  await assert.rejects(createOcrAdapter(runOcr).collect("/repo"), /at most 64 reviewable files/);
+  assert.equal(calls.length, 1);
 });
 
 test("an empty preview returns no groups without calling rule", async () => {

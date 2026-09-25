@@ -1,4 +1,5 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render as renderPage, screen, waitFor, within } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
@@ -11,17 +12,39 @@ import type {
   RunResponse,
   RunTest,
 } from "./lib/api";
-import { startFixtureRun } from "./lib/api";
+import { getSetup, startWorkspaceRun } from "./lib/setup";
+import type { SetupStatus } from "./lib/setup";
 
-vi.mock("./lib/api", () => ({ startFixtureRun: vi.fn() }));
+const workspaceStatus: SetupStatus = { mode: "workspace", configured: true, settings: null };
+vi.mock("./lib/setup", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./lib/setup")>(),
+  getSetup: vi.fn(),
+  startWorkspaceRun: vi.fn(),
+}));
 
-const startRun = vi.mocked(startFixtureRun);
+const startRun = vi.mocked(startWorkspaceRun);
+const getSetupMock = vi.mocked(getSetup);
+/** 이 스위트는 workspace 실행 버튼이 있는 프로젝트 화면에서 시작합니다. */
+const render = (ui: ReactElement): ReturnType<typeof renderPage> => {
+  window.history.replaceState(null, "", "/");
+  const view = renderPage(ui);
+  goToProject();
+  return view;
+};
+
+const goToProject = (): void => {
+  fireEvent.click(within(screen.getByRole("navigation", { name: "주 메뉴" })).getByRole("button", { name: "프로젝트 선택/분석" }));
+};
+
+const goToResults = (): void => {
+  fireEvent.click(within(screen.getByRole("navigation", { name: "주 메뉴" })).getByRole("button", { name: "결과 확인" }));
+};
 
 const runId = "run-6044f357-87cc-4f3c-b656-1fb4e9a83258";
 
 /**
- * 2026-09-22 실측한 fixture 응답(오케스트레이터 fixture 모드, 201)의 골격 그대로입니다.
- * 지표가 샘플 값(2/2/3/3)과 구분되도록 파일 4개·가설 3개·테스트 4건으로만 늘렸습니다.
+ * workspace 실행 보고서(오케스트레이터 201)의 골격입니다.
+ * 파일 4개·가설 3개·테스트 4건으로 늘려 화면이 보고서 값을 그대로 읽는지 확인합니다.
  */
 const executionResult = (
   specId: string,
@@ -93,8 +116,8 @@ const verdictTest = (
 
 const buildReport = (): RunResponse => ({
   runId,
-  provider: "fixture",
-  model: "trustgate-fixture-plan",
+  provider: "openai-compatible",
+  model: "test-model",
   reviewedFiles: [
     "apps/demo-target/src/server.ts",
     "apps/demo-target/src/store.ts",
@@ -134,18 +157,18 @@ const buildReport = (): RunResponse => ({
   patchedResults: [],
   regressionVerdict: "FIXED",
   durations: { totalMs: 1840, ocrMs: 210, planningMs: 640, vulnerableMs: 470, patchedMs: 520 },
-  source: "fixture",
+  source: "workspace",
 });
 
 /**
  * 판정이 섞인 응답입니다. 테스트는 3건인데 재현 확정 2건·회귀 차단 2건이고, 집계 판정은
  * 여전히 취약(STILL_VULNERABLE)입니다. 카운트가 총계(3)나 첫 테스트 판정(FIXED)으로
- * 퇴화하면 이 fixture에서 값이 어긋납니다.
+ * 퇴화하면 이 응답에서 값이 어긋납니다.
  */
 const buildMixedReport = (): RunResponse => ({
   runId,
-  provider: "fixture",
-  model: "trustgate-fixture-plan",
+  provider: "openai-compatible",
+  model: "test-model",
   reviewedFiles: ["apps/demo-target/src/server.ts", "apps/demo-target/src/store.ts"],
   hypotheses: [
     {
@@ -174,7 +197,7 @@ const buildMixedReport = (): RunResponse => ({
   patchedResults: [],
   regressionVerdict: "STILL_VULNERABLE",
   durations: { totalMs: 1840, ocrMs: 210, planningMs: 640, vulnerableMs: 470, patchedMs: 520 },
-  source: "fixture",
+  source: "workspace",
 });
 
 /** 가설 하나·테스트 하나뿐인 응답입니다(증거 카드는 첫 테스트만 그립니다). */
@@ -264,10 +287,22 @@ const deferred = <Value,>(): Deferred<Value> => {
   return { promise, resolve, reject };
 };
 
-const clickRun = (): HTMLElement => {
-  const button = screen.getByRole("button", { name: "샘플 분석 실행" });
+/** 실행 버튼은 workspace 설정이 로드된 뒤에만 노출되므로 비동기로 찾습니다. */
+const findRunButton = (): Promise<HTMLElement> =>
+  screen.findByRole("button", { name: "프로젝트 분석" });
+
+/** 프로젝트 화면으로 이동한 뒤 실행 버튼을 누릅니다. 분석이 끝나면 결과 화면으로 넘어갑니다. */
+const clickRun = async (): Promise<HTMLElement> => {
+  goToProject();
+  const button = await findRunButton();
   fireEvent.click(button);
   return button;
+};
+
+/** 분석이 끝나면 결과 화면으로 이동하므로, 실행 버튼 상태를 보려면 프로젝트 화면으로 되돌아간다. */
+const runButton = async (): Promise<HTMLElement> => {
+  goToProject();
+  return findRunButton();
 };
 
 /** 실행을 시작해 결과까지 화면에 반영한 뒤 돌아옵니다. */
@@ -276,7 +311,7 @@ const renderReport = async (report: RunResponse): Promise<void> => {
   startRun.mockReturnValue(pending.promise);
   render(<App />);
 
-  clickRun();
+  await clickRun();
   await act(async () => {
     pending.resolve(report);
   });
@@ -308,24 +343,30 @@ const expectNoDialog = (): void => {
 };
 
 beforeEach(() => {
+  getSetupMock.mockReset().mockResolvedValue(workspaceStatus);
   startRun.mockReset();
 });
 
 describe("TrustGate dashboard", () => {
-  it("shows the four-stage evidence flow", () => {
+  it("프로젝트 화면에 실행 버튼을 두고 결과 화면은 비어 있는 상태로 시작한다", async () => {
     render(<App />);
-    expect(screen.getByText("변경 파일")).toBeInTheDocument();
-    expect(screen.getByText("취약점 가설")).toBeInTheDocument();
-    expect(screen.getByText("격리 재현")).toBeInTheDocument();
-    expect(screen.getByText("패치 회귀 검증")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "샘플 분석 실행" })).toBeEnabled();
-    expect(metricItem("회귀 차단")).toHaveTextContent("3");
-    expect(screen.getByText("샘플 값")).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "프로젝트 분석" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "샘플 분석 실행" })).toBeNull();
+    goToResults();
+    expect(metricItem("회귀 차단")).toHaveTextContent("—");
+    for (const label of ["검토 파일", "도출 가설", "재현 확정", "회귀 차단"]) {
+      expect(metricItem(label)).toHaveTextContent("—");
+    }
+    expectNoDialog();
+    expect(screen.queryByText("변경 파일")).toBeNull();
+    expect(screen.queryByText("취약점 가설")).toBeNull();
+    expect(screen.getByText("프로젝트 분석을 실행하면 단계마다 판정 근거가 남습니다.")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "실행 증거" })).toHaveTextContent("실행 증거 없음");
     expectNoDialog();
   });
 });
 
-describe("샘플 실행 안내 라이브 리전", () => {
+describe("실행 상태 안내 라이브 리전", () => {
   it("렌더 직후에도 빈 상태의 status 리전이 머리말 안에 존재한다", () => {
     render(<App />);
 
@@ -354,7 +395,7 @@ describe("샘플 실행 안내 라이브 리전", () => {
     render(<App />);
     const region = liveRegion();
 
-    const button = clickRun();
+    const button = await clickRun();
 
     expect(screen.getByRole("status")).toBe(region);
     expect(region).toHaveClass("action-notice");
@@ -362,58 +403,55 @@ describe("샘플 실행 안내 라이브 리전", () => {
     await waitFor(() => {
       expect(region).toHaveTextContent("◌");
     });
-    expect(region).toHaveTextContent("fixture 분석을 실행하는 중입니다");
+    expect(region).toHaveTextContent("프로젝트 분석을 실행하는 중입니다");
     expect(region.closest("header")).not.toBeNull();
-    expect(button).toBeDisabled();
     expect(startRun).toHaveBeenCalledTimes(1);
-    // 진행 중에는 아직 결과가 없으므로 지표는 샘플 값을 유지합니다.
-    expect(metricItem("검토 파일")).toHaveTextContent("2");
-    expect(screen.getByText("샘플 값")).toBeInTheDocument();
+    // 진행 중에는 아직 결과가 없으므로 지표는 빈 값을 유지합니다.
+    expect(metricItem("검토 파일")).toHaveTextContent("—");
     expectNoDialog();
+    // 분석 시작 시 결과 화면으로 이동하므로 실행 버튼 상태는 프로젝트 화면에서 확인합니다.
+    expect(await runButton()).toBeDisabled();
 
     await act(async () => {
       pending.resolve(buildReport());
     });
 
     await waitFor(() => {
-      expect(region).toHaveTextContent("분석 완료");
+      expect(region).toHaveTextContent(`프로젝트 분석 완료 — 실행 ${runId}`);
     });
-    expect(screen.getByRole("button", { name: "샘플 분석 실행" })).toBeEnabled();
+    expect(await runButton()).toBeEnabled();
     expectNoDialog();
   });
 
   it("실패하면 서버 문구 대신 고정 오류 문구를 같은 리전에 남긴다", async () => {
     const pending = deferred<RunResponse>();
     startRun.mockReturnValue(pending.promise);
-    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
     render(<App />);
     const region = liveRegion();
 
-    clickRun();
+    await clickRun();
     await act(async () => {
-      pending.reject(new Error("이미 실행 중인 분석이 있습니다"));
+      pending.reject(new Error("server-private-key"));
     });
 
     await waitFor(() => {
-      expect(region).toHaveTextContent("이미 실행 중인 분석이 있습니다");
+      expect(region).toHaveTextContent("프로젝트 분석에 실패했습니다");
     });
     expect(region).toHaveTextContent("!");
-    expect(screen.getByRole("button", { name: "샘플 분석 실행" })).toBeEnabled();
-    expect(alertSpy).not.toHaveBeenCalled();
-    // 실패하면 지표와 증거 카드는 샘플 값을 유지합니다.
-    expect(metricItem("검토 파일")).toHaveTextContent("2");
-    expect(evidenceCard("수정 전 응답")).toHaveTextContent("HTTP 200");
+    expect(region).not.toHaveTextContent("server-private-key");
+    expect(metricItem("검토 파일")).toHaveTextContent("—");
+    expect(screen.getByRole("region", { name: "실행 증거" })).toHaveTextContent("실행 증거 없음");
+    expect(await runButton()).toBeEnabled();
     expectNoDialog();
-    alertSpy.mockRestore();
   });
 });
 
 describe("실행 재진입 가드", () => {
-  it("같은 태스크에서 두 번 눌러도 POST는 한 번만 나가고 버튼은 잠긴다", () => {
+  it("같은 태스크에서 두 번 눌러도 POST는 한 번만 나가고 버튼은 잠긴다", async () => {
     const pending = deferred<RunResponse>();
     startRun.mockReturnValue(pending.promise);
     render(<App />);
-    const button = screen.getByRole("button", { name: "샘플 분석 실행" });
+    const button = await findRunButton();
 
     // 버튼의 disabled는 다음 렌더 뒤에 붙습니다. 두 번째 클릭이 그 전에 들어오면
     // 이전에는 POST가 두 번 나갔습니다.
@@ -423,7 +461,7 @@ describe("실행 재진입 가드", () => {
     });
 
     expect(startRun).toHaveBeenCalledTimes(1);
-    expect(button).toBeDisabled();
+    expect(await runButton()).toBeDisabled();
     expectNoDialog();
   });
 
@@ -433,22 +471,22 @@ describe("실행 재진입 가드", () => {
     startRun.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     render(<App />);
 
-    clickRun();
+    await clickRun();
     await act(async () => {
       first.resolve(buildReport());
     });
     await waitFor(() => {
-      expect(liveRegion()).toHaveTextContent("분석 완료");
+      expect(liveRegion()).toHaveTextContent(`프로젝트 분석 완료 — 실행 ${runId}`);
     });
 
-    clickRun();
+    await clickRun();
 
     expect(startRun).toHaveBeenCalledTimes(2);
     await act(async () => {
       second.resolve(buildReport());
     });
     await waitFor(() => {
-      expect(liveRegion()).toHaveTextContent("분석 완료");
+      expect(liveRegion()).toHaveTextContent(`프로젝트 분석 완료 — 실행 ${runId}`);
     });
   });
 
@@ -458,63 +496,33 @@ describe("실행 재진입 가드", () => {
     startRun.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     render(<App />);
 
-    const button = clickRun();
+    await clickRun();
     await act(async () => {
       first.reject(new Error("분석 실행이 실패했습니다"));
     });
     await waitFor(() => {
-      expect(liveRegion()).toHaveTextContent("분석 실행이 실패했습니다");
+      expect(liveRegion()).toHaveTextContent("프로젝트 분석에 실패했습니다");
     });
     // 실패 경로도 실행 잠금을 풀어야 합니다(해제가 finally 밖으로 새면 여기서 잠깁니다).
-    expect(button).toBeEnabled();
+    expect(await runButton()).toBeEnabled();
 
-    fireEvent.click(button);
+    // 분석 시작과 함께 결과 화면으로 이동하므로, 두 번째 실행은 프로젝트 화면에서 누릅니다.
+    await clickRun();
 
     expect(startRun).toHaveBeenCalledTimes(2);
+    const secondButton = await runButton();
+    expect(secondButton).toBeDisabled();
     await waitFor(() => {
-      expect(button).toBeDisabled();
-      expect(liveRegion()).toHaveTextContent("fixture 분석을 실행하는 중입니다");
+      expect(liveRegion()).toHaveTextContent("프로젝트 분석을 실행하는 중입니다");
     });
 
     await act(async () => {
       second.resolve(buildReport());
     });
     await waitFor(() => {
-      expect(liveRegion()).toHaveTextContent("분석 완료");
+      expect(liveRegion()).toHaveTextContent(`프로젝트 분석 완료 — 실행 ${runId}`);
     });
     expectNoDialog();
-  });
-});
-
-describe("깨진 2xx 응답 경계", () => {
-  it("가드가 막은 바디는 흰 화면 대신 고정 문구로 남고 샘플 값을 유지한다", async () => {
-    // App의 모듈 mock을 실제 구현으로 되돌리고 fetch만 스텁해, api.ts 가드 → App 오류
-    // 화면까지를 한 번에 지납니다(리뷰 재현: {runId, hypotheses: []} → reviewedFiles.length).
-    const actual = await vi.importActual<typeof import("./lib/api")>("./lib/api");
-    startRun.mockImplementation(actual.startFixtureRun);
-    const fetchStub = vi.fn(
-      async () => new Response(JSON.stringify({ runId: "run-1", hypotheses: [] }), { status: 201 }),
-    );
-    vi.stubGlobal("fetch", fetchStub);
-    try {
-      render(<App />);
-
-      clickRun();
-
-      await waitFor(() => {
-        expect(liveRegion()).toHaveTextContent("응답 형식이 올바르지 않습니다");
-      });
-      expect(fetchStub).toHaveBeenCalledTimes(1);
-      // 지표·증거 카드는 샘플 값 그대로입니다(렌더 중 예외도 없습니다).
-      expect(metricItem("검토 파일")).toHaveTextContent("2");
-      expect(screen.getByText("샘플 값")).toBeInTheDocument();
-      expect(evidenceCard("수정 전 응답")).toHaveTextContent("HTTP 200");
-      expect(screen.queryByText("실제 실행 결과")).toBeNull();
-      expect(screen.getByRole("button", { name: "샘플 분석 실행" })).toBeEnabled();
-      expectNoDialog();
-    } finally {
-      vi.unstubAllGlobals();
-    }
   });
 });
 
@@ -529,8 +537,8 @@ describe("깊은 request.body 렌더 경계", () => {
     // 엔진 원문(RangeError/스택 문구)은 화면 계약상 노출 금지입니다.
     expect(page).not.toMatch(/RangeError|Maximum call stack|stack size exceeded/);
 
-    // 2) 모든 섹션이 남고 지표는 report 값(2/2/3/3)입니다.
-    for (const name of ["요약 지표", "분석 흐름", "실행 증거", "관리 범위", "라이선스와 제3자 고지"]) {
+    // 2) 결과·법적 고지 섹션이 남고 지표는 report 값(2/2/3/3)입니다.
+    for (const name of ["요약 지표", "분석 흐름", "실행 증거", "라이선스와 제3자 고지"]) {
       expect(screen.getByRole("region", { name })).toBeInTheDocument();
     }
     expect(metricItem("검토 파일")).toHaveTextContent("2");
@@ -559,13 +567,13 @@ describe("깊은 request.body 렌더 경계", () => {
   });
 });
 
-describe("fixture 실행 결과 렌더", () => {
+describe("workspace 실행 결과 렌더", () => {
   it("요약 지표를 report 값으로 바꾸고 실제 실행 결과 배지를 단다", async () => {
     const pending = deferred<RunResponse>();
     startRun.mockReturnValue(pending.promise);
     render(<App />);
 
-    clickRun();
+    await clickRun();
     await act(async () => {
       pending.resolve(buildReport());
     });
@@ -577,8 +585,8 @@ describe("fixture 실행 결과 렌더", () => {
     expect(metricItem("도출 가설")).toHaveTextContent("3");
     expect(metricItem("재현 확정")).toHaveTextContent("4");
     expect(metricItem("회귀 차단")).toHaveTextContent("4");
-    expect(screen.queryByText("샘플 값")).toBeNull();
-    expect(screen.getByText(/숫자는 fixture-plan\.json을 실행한 결과에서 계산했습니다/)).toBeInTheDocument();
+    expect(screen.queryByText("분석 결과 없음")).toBeNull();
+    expect(screen.getByText(/숫자는 이번 workspace 실행 보고서에서 계산했습니다/)).toBeInTheDocument();
     expectNoDialog();
   });
 
@@ -587,7 +595,7 @@ describe("fixture 실행 결과 렌더", () => {
     startRun.mockReturnValue(pending.promise);
     render(<App />);
 
-    clickRun();
+    await clickRun();
     await act(async () => {
       pending.resolve(buildReport());
     });
@@ -600,7 +608,7 @@ describe("fixture 실행 결과 렌더", () => {
     expect(within(flow).getByText("재현 확정 4건")).toBeInTheDocument();
     expect(within(flow).getByText("회귀 통과 · 차단 4건")).toBeInTheDocument();
     expect(within(flow).getByText(/apps\/demo-target\/src\/session\.ts/)).toBeInTheDocument();
-    expect(within(flow).getByText(/trustgate-fixture-plan/)).toBeInTheDocument();
+    expect(within(flow).getByText(/openai-compatible \/ test-model/)).toBeInTheDocument();
     expectNoDialog();
   });
 
@@ -609,7 +617,7 @@ describe("fixture 실행 결과 렌더", () => {
     startRun.mockReturnValue(pending.promise);
     render(<App />);
 
-    clickRun();
+    await clickRun();
     await act(async () => {
       pending.resolve(buildReport());
     });
@@ -623,7 +631,6 @@ describe("fixture 실행 결과 렌더", () => {
     expect(evidenceCard("수정 전 응답")).toHaveTextContent("status: 기대 400, 실제 200");
     expect(evidenceCard("수정 후 응답")).toHaveTextContent("판정 BLOCKED");
     expect(evidenceCard("판정")).toHaveTextContent("회귀 판정: 회귀 통과 (FIXED)");
-    // 샘플 카드의 본문(HTTP 코드)은 실제 결과로 대체됩니다.
     expect(screen.queryByText(/HTTP \d{3}/)).toBeNull();
     expectNoDialog();
   });
@@ -633,13 +640,13 @@ describe("fixture 실행 결과 렌더", () => {
     startRun.mockReturnValue(pending.promise);
     render(<App />);
 
-    clickRun();
+    await clickRun();
     await act(async () => {
       pending.resolve(buildReport());
     });
 
     await waitFor(() => {
-      expect(liveRegion()).toHaveTextContent(`분석 완료 — 실행 ${runId}`);
+      expect(liveRegion()).toHaveTextContent(`프로젝트 분석 완료 — 실행 ${runId}`);
     });
     expect(liveRegion().querySelector('[aria-hidden="true"]')).not.toBeNull();
     expect(liveRegion().closest("header")).not.toBeNull();

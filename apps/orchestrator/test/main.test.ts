@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,6 +14,7 @@ import {
   readPort,
   type ServerLogRecord,
 } from "../src/main.js";
+import { buildServer, WorkspaceUnavailableError, type RunTask } from "../src/server.js";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const APP_DIR = join(MODULE_DIR, "..");
@@ -65,9 +66,14 @@ type SpawnedMain = {
 
 /** Starts the real entry point; no port is bound unless the configuration is valid. */
 const spawnMain = (env: Record<string, string>): SpawnedMain => {
+  // Spawn tests must not inherit live provider settings and accidentally invoke paid calls.
+  const inherited = { ...process.env };
+  for (const key of ["TRUSTGATE_WORKSPACE_ROOT", "TRUSTGATE_LLM_BASE_URL", "TRUSTGATE_LLM_MODEL", "TRUSTGATE_SANDBOX_IMAGE"]) {
+    delete inherited[key];
+  }
   const child = spawn(process.execPath, ["--import", "tsx", "src/main.ts"], {
     cwd: APP_DIR,
-    env: { ...process.env, ...env },
+    env: { ...inherited, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   const output = { stdout: "", stderr: "" };
@@ -257,6 +263,8 @@ test("the entry point binds its mode to the run API it serves", async () => {
     TRUSTGATE_MODE: "fixture",
     TRUSTGATE_PORT: String(port),
     TRUSTGATE_HOST: "127.0.0.1",
+    TRUSTGATE_WORKSPACE_ROOT: join(root, "not-an-existing-directory"),
+    XDG_CONFIG_HOME: root,
   });
 
   try {
@@ -269,6 +277,17 @@ test("the entry point binds its mode to the run API it serves", async () => {
     ) as { mode?: string; port?: number };
     assert.equal(started.mode, "fixture");
     assert.equal(started.port, port);
+
+    const setup = await fetch(`http://127.0.0.1:${port}/api/setup`);
+    assert.equal(setup.status, 200);
+    assert.deepEqual(await setup.json(), { mode: "fixture", configured: false, settings: null });
+    const saved = await fetch(`http://127.0.0.1:${port}/api/setup`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: `http://127.0.0.1:${port}` },
+      body: JSON.stringify({ kind: "openai-compatible", baseUrl: "http://127.0.0.1:9999/v1", model: "local", apiKeyEnv: "", sandboxImage: "localhost/trustgate-target:latest" }),
+    });
+    assert.equal(saved.status, 200);
+    assert.equal((await saved.json()).mode, "fixture");
 
     const workspace = await fetch(`http://127.0.0.1:${port}/api/runs`, {
       method: "POST",
@@ -489,5 +508,104 @@ test("importing the entry point without an entry argument starts nothing", async
     assert.equal(output.stderr, "");
   } finally {
     child.kill("SIGKILL");
+  }
+});
+
+test("workspace entry point uses only the explicit project root and rejects escapes", async () => {
+  const isolated = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "trustgate-main-root-"));
+  const project = join(isolated, "different-project");
+  const sibling = join(isolated, "sibling");
+  await mkdir(join(project, "repo"), { recursive: true });
+  await mkdir(sibling);
+  await symlink(sibling, join(project, "escape"), "dir");
+  const port = await freePort();
+  const { child, output, exited } = spawnMain({
+    TRUSTGATE_MODE: "workspace",
+    TRUSTGATE_WORKSPACE_ROOT: project,
+    TRUSTGATE_PORT: String(port),
+    TRUSTGATE_HOST: "127.0.0.1",
+    XDG_CONFIG_HOME: isolated,
+  });
+  try {
+    await waitFor(() => output.stdout.includes("server.started"), "workspace server.started record");
+    const endpoint = `http://127.0.0.1:${port}`;
+    const setup = await fetch(`${endpoint}/api/setup`);
+    assert.equal(setup.status, 200);
+    assert.deepEqual(await setup.json(), { mode: "workspace", configured: false, settings: null });
+    const run = (repoPath?: string) => fetch(`${endpoint}/api/runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source: "workspace", ...(repoPath === undefined ? {} : { repoPath }) }),
+    });
+    // No settings are present: accepted paths reach the unavailable gate, without LLM calls.
+    assert.equal((await run("repo")).status, 503);
+    assert.equal((await run()).status, 503);
+    for (const rejected of ["../sibling", "repo/../escape", "escape", sibling]) {
+      const response = await run(rejected);
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), { error: "invalid repository path" });
+    }
+    assertNoInternalDetail(output.stdout + output.stderr);
+    assert.ok(!output.stdout.includes(project));
+    child.kill("SIGTERM");
+    assert.equal((await withTimeout(exited, "workspace shutdown")).code, 0);
+  } finally {
+    child.kill("SIGKILL");
+    await rm(isolated, { recursive: true, force: true });
+  }
+});
+
+test("workspace root must be an explicitly configured absolute existing directory", async () => {
+  const isolated = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "trustgate-main-bad-root-"));
+  const file = join(isolated, "file");
+  await writeFile(file, "not a directory");
+  try {
+    for (const root of [undefined, "", "relative-project", join(isolated, "missing"), file]) {
+      const { child, output, exited } = spawnMain({
+        TRUSTGATE_MODE: "workspace",
+        TRUSTGATE_HOST: "127.0.0.1",
+        TRUSTGATE_PORT: String(await freePort()),
+        ...(root === undefined ? {} : { TRUSTGATE_WORKSPACE_ROOT: root }),
+      });
+      try {
+        assert.deepEqual(await withTimeout(exited, "invalid workspace root"), { code: 1, signal: null });
+        assert.deepEqual(jsonLines(output.stdout), [{ event: "server.failed", reason: "invalid_workspace_root" }]);
+        assert.equal(output.stderr, "");
+        assert.ok(!output.stdout.includes(isolated));
+        assertNoInternalDetail(output.stdout + output.stderr);
+      } finally { child.kill("SIGKILL"); }
+    }
+  } finally { await rm(isolated, { recursive: true, force: true }); }
+});
+
+test("workspace server passes canonical in-root paths to an injected no-cost executor", async () => {
+  const isolated = await mkdtemp(join(process.env.TMPDIR ?? tmpdir(), "trustgate-main-normalize-"));
+  const project = join(isolated, "project");
+  const repo = join(project, "repo");
+  const outside = join(isolated, "outside");
+  await mkdir(repo, { recursive: true });
+  await mkdir(outside);
+  await symlink(repo, join(project, "alias"), "dir");
+  await symlink(outside, join(project, "escape"), "dir");
+  const tasks: RunTask[] = [];
+  const app = buildServer({
+    mode: "workspace",
+    rootDir: project,
+    executeRun: async (task) => { tasks.push(task); throw new WorkspaceUnavailableError(); },
+  });
+  try {
+    for (const path of ["repo", "alias", undefined]) {
+      const response = await app.inject({ method: "POST", url: "/api/runs", payload: { source: "workspace", ...(path === undefined ? {} : { repoPath: path }) } });
+      assert.equal(response.statusCode, 503);
+    }
+    assert.deepEqual(tasks.map((task) => task.repoPath), [await realpath(repo), await realpath(repo), await realpath(project)]);
+    for (const path of ["escape", "../outside", "repo/../escape", outside]) {
+      const response = await app.inject({ method: "POST", url: "/api/runs", payload: { source: "workspace", repoPath: path } });
+      assert.equal(response.statusCode, 400);
+    }
+    assert.equal(tasks.length, 3);
+  } finally {
+    await app.close();
+    await rm(isolated, { recursive: true, force: true });
   }
 });

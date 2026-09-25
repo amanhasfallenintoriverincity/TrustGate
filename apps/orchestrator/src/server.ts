@@ -14,9 +14,10 @@
  * is wired once at the sink in `buildServer` — a value that still reaches a field is
  * removed before any sink can observe it.
  */
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { STATUS_CODES } from "node:http";
 import type { Socket } from "node:net";
 import { homedir } from "node:os";
@@ -34,13 +35,22 @@ import Fastify, {
   type ConnectionError,
   type FastifyError,
   type FastifyInstance,
+  type FastifyReply,
   type FastifyRequest,
 } from "fastify";
 
 import { collectDiffs, type FileDiff } from "./diff-collector.js";
 import { createOcrAdapter, type ReviewInput } from "./ocr-adapter.js";
+import { ExistingOAuthLoginError, localOAuthLogin, type OAuthLogin } from "./oauth-login.js";
 import { createSecurityPlanner, type PlannerInput } from "./planner.js";
 import { createRedactingSink } from "./redaction.js";
+import {
+  createSetupStore,
+  parseSetupSettings,
+  ProviderChangedError,
+  type SetupSettings,
+  type SetupStore,
+} from "./setup-store.js";
 import {
   createRunReport,
   type ReportDurations,
@@ -112,6 +122,14 @@ export type BuildServerOptions = {
   executeRun?: RunExecutor;
   /** Workspace stage override; only consulted when the default executor runs. */
   createWorkspacePipeline?: WorkspacePipelineFactory;
+  /** Test seam for the built-in pipeline after live settings resolution. */
+  createWorkspacePipelineForSettings?: (task: RunTask, settings: SetupSettings) => Promise<WorkspacePipeline> | WorkspacePipeline;
+  /** Prebuilt dashboard directory override for isolated tests; defaults to apps/web/dist. */
+  dashboardDistDir?: string;
+  /** Nonsecret settings store override; tests must not access the user's config. */
+  setupStore?: SetupStore;
+  /** Injected login runner for tests; production uses pinned local SDK. */
+  oauthLogin?: OAuthLogin;
   /** Safe metadata sink. Defaults to a no-op so nothing leaks without an opt-in. */
   log?: (record: RunLogRecord) => void;
 };
@@ -131,6 +149,8 @@ const RUN_NOT_FOUND = { error: "run not found" } as const;
 const NOT_FOUND = { error: "not found" } as const;
 const RUN_FAILED = { error: "run failed" } as const;
 const WORKSPACE_UNAVAILABLE = { error: "workspace analysis unavailable" } as const;
+const SETUP_UNAVAILABLE = { error: "setup unavailable" } as const;
+const CONNECTION_TEST_FAILED = { error: "connection test failed" } as const;
 
 const PUBLIC_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const PROVIDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -151,6 +171,100 @@ const DURATION_KEYS = [
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 // Both `src/` and `dist/` sit three levels below the repository root.
 const DEFAULT_ROOT_DIR = resolve(moduleDirectory, "..", "..", "..");
+const DEFAULT_DASHBOARD_DIR = resolve(moduleDirectory, "..", "..", "web", "dist");
+const ASSET_NAME = /^[A-Za-z0-9_-]+-[A-Za-z0-9_-]{8,}\.(?:js|css|svg|png|webp|woff2?|ico)$/;
+const ASSET_MIME: Record<string, string> = {
+  js: "application/javascript; charset=utf-8",
+  css: "text/css; charset=utf-8",
+  svg: "image/svg+xml",
+  png: "image/png",
+  webp: "image/webp",
+  woff: "font/woff",
+  woff2: "font/woff2",
+  ico: "image/x-icon",
+};
+const DASHBOARD_UNAVAILABLE = { error: "dashboard unavailable" } as const;
+const SKILL_INSTALL_UNAVAILABLE = { error: "skill install unavailable" } as const;
+const SKILL_ALREADY_INSTALLED = { error: "skill already installed" } as const;
+const SKILL_AGENT_DIR = { codex: ".agents", claude: ".claude", cursor: ".cursor", hermes: ".hermes" } as const;
+type SkillAgent = keyof typeof SKILL_AGENT_DIR;
+const INSTALLER_PATH = resolve(DEFAULT_ROOT_DIR, "bin", "trustgate.mjs");
+const INSTALL_TIMEOUT_MS = 10_000;
+
+/** Invoke only the bundled skill installer; never a shell or an agent executable. */
+const runSkillInstaller = (agent: SkillAgent, root: string): Promise<boolean> =>
+  new Promise((done) => {
+    execFile(process.execPath, [INSTALLER_PATH, "skill", "install", "--agent", agent, "--project", root], {
+      shell: false,
+      timeout: INSTALL_TIMEOUT_MS,
+      maxBuffer: 4_096,
+      windowsHide: true,
+      env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    }, (error) => done(error === null));
+  });
+
+const installedSkillFile = (root: string, agent: SkillAgent): string =>
+  join(root, SKILL_AGENT_DIR[agent], "skills", "trustgate", "SKILL.md");
+const existingSkill = async (path: string): Promise<"missing" | "installed" | "blocked"> => {
+  try { await lstat(path); return "installed"; }
+  catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "blocked";
+  }
+};
+
+type DashboardAsset = { content: Buffer; mime: string };
+/** Snapshot only prebuilt hashed assets; no request path is ever used as a filesystem path. */
+const loadDashboard = (dist: string): Map<string, DashboardAsset> | undefined => {
+  try {
+    const assetsDir = join(dist, "assets");
+    if (!lstatSync(dist).isDirectory() || !lstatSync(assetsDir).isDirectory()) return undefined;
+    const readSafeFile = (path: string, maxBytes: number): Buffer => {
+      const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const stats = fstatSync(fd);
+        if (!stats.isFile() || stats.size > maxBytes) throw new Error("invalid dashboard asset");
+        return readFileSync(fd);
+      } finally { closeSync(fd); }
+    };
+    const index = readSafeFile(join(dist, "index.html"), 1_048_576);
+    const html = index.toString("utf8");
+    const references = [...html.matchAll(/(?:src|href)="\/assets\/([^"/]+)"/g)].map((match) => match[1]);
+    if (references.length === 0 || references.some((name) => name === undefined || !ASSET_NAME.test(name))) return undefined;
+    const assets = new Map<string, DashboardAsset>([["/", { content: index, mime: "text/html; charset=utf-8" }]]);
+    for (const name of references) {
+      if (name === undefined) return undefined;
+      const extension = name.slice(name.lastIndexOf(".") + 1);
+      const mime = ASSET_MIME[extension];
+      if (mime === undefined) return undefined;
+      assets.set(`/assets/${name}`, { content: readSafeFile(join(assetsDir, name), 16_777_216), mime });
+    }
+    // Vite emits font/image URLs inside CSS, not in index.html. Snapshot only those
+    // validated, prebuilt files too; never resolve a path supplied by an HTTP request.
+    const cssReferences = references.filter((name) => name?.endsWith(".css"));
+    const embedded = new Set<string>();
+    for (const name of cssReferences) {
+      const css = assets.get(`/assets/${name}`)?.content.toString("utf8") ?? "";
+      for (const match of css.matchAll(/url\(\s*['"]?\/assets\/([^'"\s)]+)['"]?\s*\)/g)) {
+        const assetName = match[1];
+        if (assetName === undefined || !ASSET_NAME.test(assetName)) return undefined;
+        const extension = assetName.slice(assetName.lastIndexOf(".") + 1);
+        if (extension === "js" || extension === "css") return undefined;
+        embedded.add(assetName);
+        if (embedded.size > 128) return undefined;
+      }
+    }
+    for (const name of embedded) {
+      const extension = name.slice(name.lastIndexOf(".") + 1);
+      const mime = ASSET_MIME[extension];
+      if (mime === undefined) return undefined;
+      assets.set(`/assets/${name}`, { content: readSafeFile(join(assetsDir, name), 16_777_216), mime });
+    }
+    return assets;
+  } catch {
+    // Missing, corrupt, or swapped build artifacts fail closed without disclosing paths.
+    return undefined;
+  }
+};
 
 const invalidFixture = (): never => {
   throw new Error("fixture plan rejected");
@@ -234,31 +348,31 @@ const replayFixtureRun = (runId: string): RunReport =>
     durations: FIXTURE_REPLAY.durations,
   });
 
-const createDefaultWorkspacePipeline: WorkspacePipelineFactory = (task) => {
+const environmentSettings = (): SetupSettings | null => {
   const baseUrl = process.env.TRUSTGATE_LLM_BASE_URL;
   const model = process.env.TRUSTGATE_LLM_MODEL;
-  const image = process.env.TRUSTGATE_SANDBOX_IMAGE;
-  if (baseUrl === undefined || model === undefined || image === undefined) {
-    throw new WorkspaceUnavailableError();
-  }
-  const providerId =
-    task.providerId ?? process.env.TRUSTGATE_PROVIDER_ID ?? "default";
-  const apiKeyEnv = process.env.TRUSTGATE_LLM_API_KEY_ENV;
-  const kind =
-    process.env.TRUSTGATE_LLM_KIND === "anthropic-compatible"
-      ? "anthropic-compatible"
-      : "openai-compatible";
-  const client = createLlmClient({
-    id: providerId,
-    kind,
+  const sandboxImage = process.env.TRUSTGATE_SANDBOX_IMAGE;
+  if (baseUrl === undefined || model === undefined || sandboxImage === undefined) return null;
+  return parseSetupSettings({
+    kind: process.env.TRUSTGATE_LLM_KIND ?? "openai-compatible",
     baseUrl,
     model,
-    ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
+    apiKeyEnv: process.env.TRUSTGATE_LLM_API_KEY_ENV ?? "",
+    sandboxImage,
   });
+};
+
+const createDefaultWorkspacePipeline = (settings: SetupSettings, secret: string | null): WorkspacePipelineFactory => (task) => {
+  const providerId =
+    task.providerId ?? process.env.TRUSTGATE_PROVIDER_ID ?? "default";
+  const client = createLlmClient(settings.kind === "openai-codex-oauth"
+    ? { id: providerId, kind: settings.kind, model: settings.model }
+    : { id: providerId, kind: settings.kind, baseUrl: settings.baseUrl, model: settings.model,
+        ...(settings.apiKeyEnv === "" ? (secret ? { headers: settings.kind === "openai-compatible" ? { authorization: `Bearer ${secret}` } : { "x-api-key": secret } } : {}) : { apiKeyEnv: settings.apiKeyEnv }) });
   const planner = createSecurityPlanner(client);
   const ocr = createOcrAdapter();
   const sandbox = createSandboxRunner({
-    image,
+    image: settings.sandboxImage,
     hostRuntime: {
       home: process.env.HOME ?? homedir(),
       xdgRuntimeDir:
@@ -277,7 +391,13 @@ const createDefaultWorkspacePipeline: WorkspacePipelineFactory = (task) => {
 };
 
 export const createDefaultExecutor = (
-  createWorkspacePipeline: WorkspacePipelineFactory = createDefaultWorkspacePipeline,
+  createWorkspacePipeline: WorkspacePipelineFactory = async (task) => {
+    let settings: SetupSettings | null;
+    try { settings = (await createSetupStore().read()) ?? environmentSettings(); }
+    catch { throw new WorkspaceUnavailableError(); }
+    if (settings === null) throw new WorkspaceUnavailableError();
+    return createDefaultWorkspacePipeline(settings, await createSetupStore().readCredential(settings))(task);
+  },
 ): RunExecutor => {
   return async (task) => {
     if (task.source === "fixture") return replayFixtureRun(task.runId);
@@ -532,6 +652,17 @@ const clientErrorStatus = (error: ConnectionError): number => {
 /** Fixed payload for parse-level failures; never carries request or framework text. */
 const CLIENT_ERROR_BODY = JSON.stringify(INVALID_REQUEST);
 
+const localRequest = (request: FastifyRequest, writing: boolean): boolean => {
+  const host = request.headers.host;
+  if (typeof host !== "string" ||
+      !/^(?:127\.0\.0\.1|localhost|\[::1\])(?::[1-9]\d{0,4})?$/.test(host) ||
+      !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.ip)) return false;
+  const origin = request.headers.origin;
+  if (origin === undefined) return !writing;
+  return origin === "http://127.0.0.1:5173" ||
+    origin === "http://localhost:5173" || origin === `http://${host}`;
+};
+
 export const buildServer = (options: BuildServerOptions = {}): FastifyInstance => {
   const mode = options.mode ?? "workspace";
   const rootDir = options.rootDir ?? DEFAULT_ROOT_DIR;
@@ -540,11 +671,30 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
   // check below refuses it. A root that cannot be pinned admits nothing at all: failing closed
   // keeps a mistyped or missing root from being redefined by whoever controls its parent.
   const rootIdentity = pinRootIdentity(rootDir);
+  const dashboard = loadDashboard(options.dashboardDistDir ?? DEFAULT_DASHBOARD_DIR);
   // The one place this server hands records to a log sink: wrap the caller's sink once, here, so
   // no code path — present or future — can write an unredacted record to it.
   const log = options.log === undefined ? undefined : createRedactingSink(options.log);
-  const createWorkspacePipeline =
-    options.createWorkspacePipeline ?? createDefaultWorkspacePipeline;
+  // Resolve the default path at request time, so a malformed XDG environment fails closed
+  // through the fixed API error rather than crashing the server during startup.
+  const setupStore: SetupStore = options.setupStore ?? {
+    read: () => createSetupStore().read(),
+    save: (value) => createSetupStore().save(value),
+    readCredential: (settings) => createSetupStore().readCredential(settings),
+    saveCredential: (secret, provider) => createSetupStore().saveCredential(secret, provider),
+  };
+  const effectiveSettings = async (): Promise<SetupSettings | null> =>
+    (await setupStore.read()) ?? environmentSettings();
+  const createWorkspacePipeline: WorkspacePipelineFactory =
+    options.createWorkspacePipeline ?? (async (task) => {
+      let settings: SetupSettings | null;
+      try { settings = await effectiveSettings(); }
+      catch { throw new WorkspaceUnavailableError(); }
+      if (settings === null) throw new WorkspaceUnavailableError();
+      return options.createWorkspacePipelineForSettings === undefined
+        ? createDefaultWorkspacePipeline(settings, await setupStore.readCredential(settings))(task)
+        : options.createWorkspacePipelineForSettings(task, settings);
+    });
   const executeRun =
     options.executeRun ??
     createDefaultExecutor(
@@ -554,6 +704,7 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
     );
 
   const runs = new Map<string, RunResponse>();
+  const installsInFlight = new Set<SkillAgent>();
   let inFlight = false;
 
   const rememberRun = (run: RunResponse): void => {
@@ -625,7 +776,204 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
 
   app.get("/health", async () => ({ ok: true }));
 
-  app.post("/api/runs", async (request, reply) => {
+  const serveDashboard = (key: string, request: FastifyRequest, reply: FastifyReply) => {
+    if (!localRequest(request, false)) return reply.status(403).send(INVALID_REQUEST);
+    if (dashboard === undefined) return reply.status(503).send(DASHBOARD_UNAVAILABLE);
+    const asset = dashboard.get(key);
+    if (asset === undefined) return reply.status(404).send(NOT_FOUND);
+    return reply.header("x-content-type-options", "nosniff")
+      .header("content-type", asset.mime).send(asset.content);
+  };
+  app.get("/", async (request, reply) => serveDashboard("/", request, reply));
+  app.get("/index.html", async (request, reply) => serveDashboard("/", request, reply));
+  app.get("/assets/:name", async (request, reply) => {
+    const name = (request.params as { name: string }).name;
+    if (!ASSET_NAME.test(name)) return reply.status(404).send(NOT_FOUND);
+    return serveDashboard(`/assets/${name}`, request, reply);
+  });
+
+  // Guard the resolved setup routes, not the raw URL: Fastify also routes encoded aliases.
+  // Apply before parsing/handlers so rejected writes cannot save or call a provider.
+  const guardSetup = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    reply.header("cache-control", "no-store");
+    if (!localRequest(request, request.method !== "GET")) {
+      reply.status(403).send(INVALID_REQUEST);
+    }
+  };
+
+  let oauthState: "idle" | "pending" | "ready" | "error" | "existing" = "idle";
+  let oauthController: AbortController | undefined;
+  const login = options.oauthLogin ?? localOAuthLogin;
+  const emptyBody = (body: unknown) => body === undefined ||
+    (isPlainRecord(body) && Object.keys(body).length === 0);
+  const authorizationUrl = (message: string): string | undefined => {
+    const prefix = "OpenAI OAuth login URL: ";
+    if (!message.startsWith(prefix)) return undefined;
+    const candidate = message.slice(prefix.length);
+    try {
+      const url = new URL(candidate);
+      if (url.protocol !== "https:" || url.hostname !== "auth.openai.com" ||
+          url.pathname !== "/oauth/authorize" || url.username || url.password || url.hash) return undefined;
+      return candidate;
+    } catch { return undefined; }
+  };
+  app.get("/api/setup/oauth/status", { onRequest: guardSetup }, async () => ({ state: oauthState }));
+  app.post("/api/setup/oauth/cancel", { onRequest: guardSetup }, async (request, reply) => {
+    if (!emptyBody(request.body)) return reply.status(400).send(INVALID_REQUEST);
+    oauthController?.abort();
+    oauthController = undefined;
+    oauthState = "idle";
+    return { state: oauthState };
+  });
+  app.post("/api/setup/oauth/start", { onRequest: guardSetup }, async (request, reply) => {
+    if (!emptyBody(request.body)) return reply.status(400).send(INVALID_REQUEST);
+    if (oauthState === "pending") return reply.status(409).send({ error: "login already in progress" });
+    oauthState = "pending";
+    const controller = new AbortController();
+    oauthController = controller;
+    let resolveUrl!: (url: string | undefined) => void;
+    const urlPromise = new Promise<string | undefined>((resolve) => { resolveUrl = resolve; });
+    let validUrlSeen = false;
+    const timer = setTimeout(() => controller.abort(), 300_000);
+    void login({ signal: controller.signal, onMessage: (message) => {
+      const url = authorizationUrl(message);
+      if (url && oauthController === controller) { validUrlSeen = true; resolveUrl(url); }
+    } }).then(() => {
+      if (oauthController === controller) oauthState = validUrlSeen && !controller.signal.aborted ? "ready" : "error";
+    }).catch((error: unknown) => {
+      if (oauthController === controller) oauthState = error instanceof ExistingOAuthLoginError ? "existing" : "error";
+    }).finally(() => {
+      clearTimeout(timer);
+      resolveUrl(undefined);
+      if (oauthController === controller) oauthController = undefined;
+    });
+    let urlTimer: ReturnType<typeof setTimeout> | undefined;
+    const url = await Promise.race([urlPromise, new Promise<undefined>((resolve) => {
+      urlTimer = setTimeout(() => resolve(undefined), 15_000);
+    })]);
+    if (urlTimer !== undefined) clearTimeout(urlTimer);
+    if (url && oauthController === controller && !controller.signal.aborted) return { url };
+    if ((oauthState as string) === "existing") return reply.status(409).send({ state: "existing" });
+    if (oauthController === controller) {
+      controller.abort();
+      oauthController = undefined;
+      oauthState = "error";
+    }
+    return reply.status(503).send(SETUP_UNAVAILABLE);
+  });
+  app.addHook("onClose", async () => { oauthController?.abort(); });
+
+  const setupStatus = async (settings: SetupSettings | null) => ({
+    mode,
+    configured: settings !== null,
+    settings: settings === null ? null : {
+      kind: settings.kind,
+      baseUrl: settings.baseUrl,
+      model: settings.model,
+      apiKeyEnv: settings.apiKeyEnv,
+      sandboxImage: settings.sandboxImage,
+      keyAvailable: settings.kind !== "openai-codex-oauth" &&
+        (settings.apiKeyEnv === "" ? (await setupStore.readCredential(settings)) !== null : Boolean(process.env[settings.apiKeyEnv])),
+    },
+  });
+
+  app.get("/api/setup", { onRequest: guardSetup }, async (_request, reply) => {
+    try { return await setupStatus(await effectiveSettings()); }
+    catch { return reply.status(503).send(SETUP_UNAVAILABLE); }
+  });
+
+  app.post("/api/setup", { onRequest: guardSetup }, async (request, reply) => {
+    let settings: SetupSettings;
+    try { settings = parseSetupSettings(request.body); }
+    catch { return reply.status(400).send(INVALID_REQUEST); }
+    try {
+      await setupStore.save(settings);
+      return await setupStatus(settings);
+    } catch { return reply.status(503).send(SETUP_UNAVAILABLE); }
+  });
+
+  app.post("/api/setup/credential", { onRequest: guardSetup }, async (request, reply) => {
+    if (!isPlainRecord(request.body) || Object.keys(request.body).length !== 3 ||
+        !Object.hasOwn(request.body, "secret") || !Object.hasOwn(request.body, "kind") ||
+        !Object.hasOwn(request.body, "baseUrl") ||
+        typeof request.body.secret !== "string" || typeof request.body.baseUrl !== "string" ||
+        (request.body.kind !== "openai-compatible" && request.body.kind !== "anthropic-compatible"))
+      return reply.status(400).send(INVALID_REQUEST);
+    if (request.body.secret.length === 0 || Buffer.byteLength(request.body.secret) > 4096 ||
+        /[\x00-\x1f\x7f]/.test(request.body.secret) || request.body.secret.trim() !== request.body.secret)
+      return reply.status(400).send(INVALID_REQUEST);
+    try {
+      const settings = await setupStore.read();
+      if (settings === null || settings.kind === "openai-codex-oauth" || settings.apiKeyEnv !== "" ||
+          settings.kind !== request.body.kind || settings.baseUrl !== request.body.baseUrl)
+        return reply.status(409).send(INVALID_REQUEST);
+      await setupStore.saveCredential(request.body.secret, { kind: request.body.kind, baseUrl: request.body.baseUrl });
+      return { stored: true };
+    }
+    catch (error) { return reply.status(error instanceof ProviderChangedError ? 409 : 503).send(
+      error instanceof ProviderChangedError ? INVALID_REQUEST : SETUP_UNAVAILABLE); }
+  });
+
+  app.post("/api/setup/test", { onRequest: guardSetup }, async (request, reply) => {
+    if (request.body !== undefined &&
+        (!isPlainRecord(request.body) || Object.keys(request.body).length !== 0)) {
+      return reply.status(400).send(INVALID_REQUEST);
+    }
+    try {
+      const settings = await effectiveSettings();
+      if (settings === null) return reply.status(503).send(CONNECTION_TEST_FAILED);
+      const secret = await setupStore.readCredential(settings);
+      const client = createLlmClient(settings.kind === "openai-codex-oauth"
+        ? { id: "setup-test", kind: settings.kind, model: settings.model, timeoutMs: 10_000 }
+        : { id: "setup-test", kind: settings.kind, baseUrl: settings.baseUrl,
+            model: settings.model, timeoutMs: 10_000,
+            ...(settings.apiKeyEnv === "" ? (secret ? { headers: settings.kind === "openai-compatible" ? { authorization: `Bearer ${secret}` } : { "x-api-key": secret } } : {}) : { apiKeyEnv: settings.apiKeyEnv }) });
+      await client.generate({ messages: [{ role: "user", content: "ping" }], maxTokens: 8 });
+      return { ok: true };
+    } catch { return reply.status(503).send(CONNECTION_TEST_FAILED); }
+  });
+
+  app.post("/api/skills/install", { onRequest: guardSetup }, async (request, reply) => {
+    if (!isPlainRecord(request.body) || Object.keys(request.body).length !== 1 ||
+        !Object.hasOwn(request.body, "agent") ||
+        typeof request.body.agent !== "string" ||
+        !Object.hasOwn(SKILL_AGENT_DIR, request.body.agent)) {
+      return reply.status(400).send(INVALID_REQUEST);
+    }
+    const agent = request.body.agent as SkillAgent;
+    // Only the operator-provided root may be used, never a browser-selected project.
+    if (mode !== "workspace" || options.rootDir === undefined || !isAbsolute(options.rootDir) ||
+        rootIdentity === undefined ||
+        !(await rootStillPinned(rootDir, rootIdentity))) {
+      return reply.status(403).send(SKILL_INSTALL_UNAVAILABLE);
+    }
+    if (installsInFlight.has(agent)) return reply.status(409).send(SKILL_ALREADY_INSTALLED);
+    installsInFlight.add(agent);
+    try {
+      const target = installedSkillFile(rootIdentity.realPath, agent);
+      const status = await existingSkill(target);
+      if (status === "installed") return reply.status(409).send(SKILL_ALREADY_INSTALLED);
+      if (status === "blocked") return reply.status(503).send(SKILL_INSTALL_UNAVAILABLE);
+      // Recheck after filesystem lookup, immediately before invoking the installer.
+      if (!(await rootStillPinned(rootDir, rootIdentity))) return reply.status(403).send(SKILL_INSTALL_UNAVAILABLE);
+      if (!(await runSkillInstaller(agent, rootIdentity.realPath))) {
+        return reply.status(503).send(SKILL_INSTALL_UNAVAILABLE);
+      }
+      return reply.status(201).send({ agent, installed: true });
+    } catch { return reply.status(503).send(SKILL_INSTALL_UNAVAILABLE); }
+    finally { installsInFlight.delete(agent); }
+  });
+
+  // Run creation and report reads are local-only too; unlike setup writes, CLI clients
+  // without an Origin are allowed, but a supplied non-local Origin is still rejected.
+  const guardRun = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    reply.header("cache-control", "no-store");
+    if (!localRequest(request, false)) {
+      reply.status(403).send(INVALID_REQUEST);
+    }
+  };
+
+  app.post("/api/runs", { onRequest: guardRun }, async (request, reply) => {
     const parsed = parseRunBody(request.body, mode);
     if (!parsed.ok) {
       log?.({ event: "run.rejected", reason: parsed.reason });
@@ -698,7 +1046,7 @@ export const buildServer = (options: BuildServerOptions = {}): FastifyInstance =
     }
   });
 
-  app.get("/api/runs/:runId", async (request, reply) => {
+  app.get("/api/runs/:runId", { onRequest: guardRun }, async (request, reply) => {
     const params = request.params as { runId?: unknown };
     const runId = params.runId;
     if (

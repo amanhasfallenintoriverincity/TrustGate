@@ -194,18 +194,18 @@ test("Codex OAuth uses the injected OAuth transport without handling raw tokens"
   assert.equal(result.text, "oauth result");
 });
 
-test("remote plaintext provider URLs are rejected, while loopback HTTP is allowed", () => {
-  assert.throws(
-    () =>
-      createLlmClient({
-        id: "unsafe",
-        kind: "openai-compatible",
-        baseUrl: "http://llm.example/v1",
-        model: "model",
-      }),
-    (error: unknown) =>
-      error instanceof LlmGatewayError && error.code === "insecure_endpoint",
+test("remote plaintext provider URLs are allowed explicitly, while non-HTTP schemes are rejected", () => {
+  assert.doesNotThrow(() =>
+    createLlmClient({
+      id: "remote",
+      kind: "openai-compatible",
+      baseUrl: "http://100.83.9.79:20128/v1",
+      model: "model",
+    }),
   );
+  assert.throws(() => createLlmClient({
+    id: "invalid", kind: "openai-compatible", baseUrl: "file:///etc/passwd", model: "model",
+  }), (error: unknown) => error instanceof LlmGatewayError);
 
   assert.doesNotThrow(() =>
     createLlmClient({

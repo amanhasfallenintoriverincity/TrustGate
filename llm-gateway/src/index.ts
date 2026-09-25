@@ -117,12 +117,6 @@ const MAX_ERROR_DETAIL_LENGTH = 240;
 
 const stripTrailingSlashes = (value: string): string => value.replace(/\/+$/, "");
 
-const isLoopbackHost = (hostname: string): boolean =>
-  hostname === "localhost" ||
-  hostname === "127.0.0.1" ||
-  hostname === "[::1]" ||
-  hostname === "::1";
-
 const validateBaseUrl = (baseUrl: string): string => {
   let url: URL;
   try {
@@ -139,12 +133,6 @@ const validateBaseUrl = (baseUrl: string): string => {
     throw new LlmGatewayError(
       "invalid_configuration",
       "LLM provider URLs must not contain credentials.",
-    );
-  }
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHost(url.hostname))) {
-    throw new LlmGatewayError(
-      "insecure_endpoint",
-      "Remote LLM endpoints must use HTTPS; HTTP is allowed only on loopback.",
     );
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -234,7 +222,8 @@ const fetchJson = async (
 ): Promise<unknown> => {
   const scoped = combineSignals(requestSignal, timeoutMs);
   try {
-    const response = await fetchImpl(url, { ...init, signal: scoped.signal });
+    // Never forward an Authorization or x-api-key header through a provider redirect.
+    const response = await fetchImpl(url, { ...init, redirect: "error", signal: scoped.signal });
     await assertOk(response, providerId);
     try {
       return await response.json();

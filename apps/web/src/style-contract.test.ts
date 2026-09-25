@@ -57,10 +57,10 @@ import { describe, expect, it } from "vitest";
 //
 // 파서는 정규식이 아니라 postcss AST입니다. 정규식 파서는 CSS 중첩
 // (`.app-shell { … .action-notice:empty { display: none } }`), prefix 셀렉터
-// (`.app-header .action-notice:empty`), 두 번째 규칙, 중복 선언 같은 관용적 CSS에
+// (`.run-controls .action-notice:empty`), 두 번째 규칙, 중복 선언 같은 관용적 CSS에
 // 조용히 우회되어 실제 회귀를 green으로 통과시켰습니다.
 //
-// 셀렉터 판정은 접미(`^`) 앵커 없이 서브스트링/정규 매치로만 합니다. `.app-header
+// 셀렉터 판정은 접미(`^`) 앵커 없이 서브스트링/정규 매치로만 합니다. `.run-controls
 // .action-notice:empty`처럼 감싸진 형태도 같은 강도로 검사하기 위해서입니다.
 // 중첩 표기는 `&`를 부모의 해석된 셀렉터로 치환해 펼칩니다(`&:empty` →
 // `.action-notice:empty`, 그룹 부모는 곱집합, `&` 없는 중첩은 묵시적 후손 결합).
@@ -722,14 +722,14 @@ describe("index.css 좁은 화면 계약", () => {
       expect(wrapped, `${literal} 리터럴이 줄바꿈 그룹에서 빠졌습니다`).toContain(literal);
     }
 
-    // 클래스 스코프로 축소(`.action-meta span` 등)하면 같은 토큰이 다른 요소로 들어올 때 다시 밀려납니다.
+    // 클래스 스코프로 축소(`.metric-meta span` 등)하면 같은 토큰이 다른 요소로 들어올 때 다시 밀려납니다.
     // 위 toContain은 정확히 요소 리터럴만 인정하므로 축소형은 통과하지 못합니다.
   });
 
   it("그리드 자식이 줄어들도록 min-inline-size: 0이 선언되어 있다", () => {
-    // .app-header/.app-footer만 보던 검사를 카드 표면(.surface·.card 공유 규칙)과
+    // .run-controls/.app-footer만 보던 검사를 카드 표면(.surface·.card 공유 규칙)과
     // .footer-block까지 넓혔습니다. 그룹 셀렉터는 각 셀렉터를 개별로 확인합니다.
-    for (const selector of [".app-header", ".app-footer", ".surface", ".card", ".footer-block"]) {
+    for (const selector of [".run-controls", ".app-footer", ".surface", ".card", ".footer-block"]) {
       const declared = rules.filter(
         (rule) => rule.selectors.includes(selector) && rule.decls.has("min-inline-size"),
       );
@@ -927,8 +927,8 @@ describe("검사기 자기 검증 — 합성 CSS fixture", () => {
 
   describe("중첩 셀렉터 해석(&)", () => {
     it("중첩이 아닌 규칙은 prefix 텍스트를 그대로 남긴다", () => {
-      expect(resolvedFor(".app-header .action-notice:empty { display: none }")).toEqual([
-        ".app-header .action-notice:empty",
+      expect(resolvedFor(".run-controls .action-notice:empty { display: none }")).toEqual([
+        ".run-controls .action-notice:empty",
       ]);
     });
 
